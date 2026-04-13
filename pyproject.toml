@@ -1,0 +1,42 @@
+[project]
+name = "llm-rlhf-system-va"
+version = "0.1.0"
+description = "LLM fine-tuning with RLHF and RAG system"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    {name = "Mandy Reyes", email = "reyesm@brandeis.edu"},
+]
+
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "numpy",
+    "pandas",
+    "python-dotenv",
+    "sentence-transformers",
+    "faiss-cpu",
+    "fastapi",
+    "uvicorn",
+    "pytest",
+    "ruff",
+    "ipykernel",
+    "trl",
+    "peft",
+    "streamlit>=1.56.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

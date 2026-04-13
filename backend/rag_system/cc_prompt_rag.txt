@@ -1,0 +1,227 @@
+Build me a **super simple, modular local RAG prototype** in Python for a research project.
+
+## Goal
+
+Create a minimal Retrieval-Augmented Generation system that is easy to connect later to:
+
+* a frontend
+* a feedback / reward logging system
+* RLHF or preference learning
+* evaluation scripts
+
+Do **not** overengineer it. I want the simplest version that works clearly and is easy to expand.
+
+## Core architecture
+
+Use this pipeline:
+
+1. Load raw text documents from `data/raw/`
+2. Split documents into chunks
+3. Embed chunks with a Hugging Face / Sentence Transformers embedding model
+4. Store embeddings in a FAISS index
+5. Retrieve top-k chunks for a user query
+6. Build a prompt using the retrieved chunks
+7. Generate an answer with a Hugging Face text generation model
+
+Keep retrieval and generation as **separate modules**.
+
+## Technical requirements
+
+Use:
+
+* Python
+* `transformers`
+* `sentence-transformers`
+* `datasets`
+* `faiss-cpu`
+* `torch`
+
+Prefer a very lightweight setup.
+
+Use:
+
+* embedding model: `sentence-transformers/all-MiniLM-L6-v2`
+* simple generator placeholder: a small Hugging Face causal LM that can be swapped later
+
+## Repo structure
+
+Create this structure:
+
+rag_project/
+
+* app/
+
+  * config.py
+  * ingest.py
+  * embed.py
+  * index.py
+  * retrieve.py
+  * generate.py
+  * pipeline.py
+  * utils.py
+* data/
+
+  * raw/
+  * processed/
+  * index/
+* scripts/
+
+  * build_index.py
+  * chat_cli.py
+* tests/
+
+  * test_ingest.py
+  * test_retrieve.py
+  * test_pipeline.py
+
+* requirements.txt
+* RAG_README.md
+
+## Implementation details
+
+### `app/ingest.py`
+
+Implement:
+
+* `load_text_files(data_dir)`
+* `chunk_text(text, chunk_size=500, overlap=100)`
+* `build_chunks(docs, chunk_size=500, overlap=100)`
+
+Each chunk should store:
+
+* `chunk_id`
+* `doc_id`
+* `source`
+* `text`
+
+### `app/embed.py`
+
+Implement an `Embedder` class that:
+
+* loads `sentence-transformers/all-MiniLM-L6-v2`
+* has `encode_texts(texts, batch_size=32)`
+* has `encode_query(query)`
+
+Use normalized embeddings.
+
+### `app/index.py`
+
+Implement functions to:
+
+* build a Hugging Face `Dataset` from chunk rows + embeddings
+* add a FAISS index on the embeddings column
+* save dataset and FAISS index to `data/index/`
+* load dataset and FAISS index back
+
+### `app/retrieve.py`
+
+Implement:
+
+* `retrieve_top_k(ds, query_embedding, k=5)`
+
+Return a list of dicts containing:
+
+* `score`
+* `chunk_id`
+* `doc_id`
+* `source`
+* `text`
+
+### `app/generate.py`
+
+Implement a `Generator` class that:
+
+* loads a Hugging Face tokenizer and model
+* has `build_prompt(query, retrieved_chunks)`
+* has `generate(prompt, max_new_tokens=256)`
+
+Prompt rules:
+
+* tell the model to answer using only retrieved context
+* if evidence is insufficient, it should say so
+
+### `app/pipeline.py`
+
+Implement a `RAGPipeline` class that:
+
+* initializes the embedder and generator
+* has `build_index(raw_data_dir="data/raw", out_dir="data/index")`
+* has `load_index(out_dir="data/index")`
+* has `answer(query, k=5)`
+
+The `answer()` method should return a dictionary with:
+
+* `query`
+* `retrieved`
+* `answer`
+
+## Scripts
+
+### `scripts/build_index.py`
+
+Build the index from `data/raw/` and print a success message.
+
+### `scripts/chat_cli.py`
+
+Create a CLI loop:
+
+* user types a query
+* system retrieves top chunks
+* system prints retrieved chunk ids / sources
+* system prints generated answer
+* user can type `exit` to quit
+
+## Constraints
+
+* Keep code simple and readable
+* Add docstrings
+* Add basic error handling
+* Do not introduce databases, web APIs, Docker, LangChain, or extra frameworks
+* Do not add advanced RAG features yet
+* No reranking
+* No hybrid retrieval
+* No agentic workflows
+* No UI
+* No async
+* No premature optimization
+
+## Tests
+
+Write a few basic tests for:
+
+* chunking logic
+* retrieval output format
+* pipeline sanity
+
+## README
+
+Write a README that explains:
+
+* what the project does
+* folder structure
+* how to install
+* how to add documents
+* how to build the index
+* how to run the CLI
+* future extensions for feedback logging / RLHF / frontend integration
+
+## Important design philosophy
+
+I want this built so that it is easy later to attach:
+
+* user preference conditioning
+* response ratings / reward logging
+* evaluation scripts
+* a frontend
+* RLHF or preference optimization
+
+So keep modules loosely coupled.
+
+## Output format
+
+Please output:
+
+1. the full file tree
+2. the contents of every file
+3. short setup instructions
+4. any notes about model choices or easy future upgrades

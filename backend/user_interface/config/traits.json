@@ -1,0 +1,19 @@
+{
+  "traits": [
+    {
+      "name": "clarity",
+      "description": "The response is easy to read, well-structured, and free of jargon",
+      "weight": 0.4
+    },
+    {
+      "name": "empathy",
+      "description": "The response acknowledges the user's situation and sounds human",
+      "weight": 0.3
+    },
+    {
+      "name": "directness",
+      "description": "Gets to the point without unnecessary padding or hedging",
+      "weight": 0.3
+    }
+  ]
+}
