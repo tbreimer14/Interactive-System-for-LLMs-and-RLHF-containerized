@@ -34,8 +34,8 @@ CONFIG   = ROOT / "config" / "traits.json"
 LOG_PATH = str(ROOT / "logs" / "interaction_log.jsonl")
 
 # ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="RLHF Interface", layout="wide")
-st.title("RLHF Research Interface")
+st.set_page_config(page_title="Interactive RLHF System", layout="wide")
+st.title("Interactive RLHF System")
 
 # ── Init ───────────────────────────────────────────────────────────────────────
 default_traits = [TraitConfig.from_dict(t) for t in load_traits(str(CONFIG))]

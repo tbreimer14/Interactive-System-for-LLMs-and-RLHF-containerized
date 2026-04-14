@@ -38,12 +38,12 @@ def prompt_panel(adapter) -> None:
 
     Calls adapter.generate() on submit and writes result to session state.
     """
-    st.subheader("1. Prompt")
+    st.subheader("1. User Query")
 
     prompt = st.text_area(
         "prompt",
         height=120,
-        placeholder="Type a question or post here...",
+        placeholder="Enter a question or prompt...",
         label_visibility="collapsed",
     )
 
@@ -54,7 +54,7 @@ def prompt_panel(adapter) -> None:
             if not prompt.strip():
                 st.warning("Please enter a prompt first.")
             else:
-                with st.spinner("Generating..."):
+                with st.spinner("Retrieving context and generating with Qwen2.5-3B-Instruct + LoRA..."):
                     try:
                         result = adapter.generate(prompt.strip(), top_k=3)
                         state.set_rag_result(result)
@@ -69,7 +69,7 @@ def prompt_panel(adapter) -> None:
     # Response display
     rag = state.get_rag_result()
     if rag:
-        st.subheader("2. Response")
+        st.subheader("2. Model Response — Qwen2.5-3B-Instruct + LoRA")
         st.markdown(rag["answer"])
 
 
@@ -86,7 +86,7 @@ def context_panel() -> None:
     if not rag:
         return
 
-    with st.expander("3. Retrieved context", expanded=False):
+    with st.expander("3. Retrieved Context — FAISS (all-MiniLM-L6-v2)", expanded=False):
         chunks = rag.get("retrieved", [])
         if not chunks:
             st.caption("No chunks retrieved.")
@@ -110,7 +110,7 @@ def traits_editor() -> None:
       - remove an existing trait
       - edit the weight of any trait in-place
     """
-    st.subheader("4. Traits")
+    st.subheader("4. Reward Traits")
 
     traits = state.get_traits()
 
@@ -178,7 +178,8 @@ def scoring_panel(adapter) -> tuple:
     if not traits:
         return None, None
 
-    st.subheader("5. Score this response")
+    st.subheader("5. Human Feedback — Reward Signal")
+    st.caption("Scores are passed to the Reward Function. The scalar reward is logged to JSONL and used by GRPO to update LLM weights.")
 
     scores = {}
     for trait in traits:
@@ -224,10 +225,10 @@ def save_panel(scored_traits, scalar_reward, log_path: str) -> None:
     if not state.get_rag_result() or scored_traits is None:
         return
 
-    st.subheader("6. Save")
+    st.subheader("6. Log to JSONL → GRPO Training Data")
 
     if state.is_saved():
-        st.success("Interaction saved to log.")
+        st.success("Interaction saved to training log.")
         return
 
     if st.button("Save interaction", type="primary"):
@@ -260,7 +261,8 @@ def history_panel() -> None:
     Shows past saved interactions loaded from JSONL at startup,
     plus any saved in the current session.
     """
-    st.subheader("History")
+    st.subheader("Training Log")
+    st.caption("Saved interactions used as GRPO training data.")
 
     entries = list(reversed(state.get_history()))
 
