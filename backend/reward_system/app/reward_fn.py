@@ -27,8 +27,8 @@ def compute_reward(
         prompt:      the original user prompt (passed through for context/logging)
         response:    the model response that was scored (passed through)
         traits:      list of trait dicts from load_traits()
-        user_scores: user-provided score for each trait, e.g. {"warmth": 4, "directness": 3}
-                     scores can be any numeric scale (e.g. 1–5, 0–10)
+        user_scores: user-provided score for each trait, e.g. {"warmth": 3, "directness": -2}
+                     scores use a -5 to +5 scale; negative values penalise the response
 
     Returns:
         RewardResult with:

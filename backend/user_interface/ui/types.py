@@ -8,7 +8,7 @@ pulling in heavy dependencies. Each model maps directly to a section
 of the JSONL interaction log format.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -52,19 +52,17 @@ class InteractionLog:
     """One complete scored interaction, ready to be written to JSONL."""
     timestamp: str
     prompt: str
-    retrieved_chunks: list          # list of {"text": str, "source": str}
     response: str
-    traits: list                    # list of ScoredTrait.to_dict()
+    traits: list       # list of ScoredTrait.to_dict()
     scalar_reward: float
 
     def to_dict(self) -> dict:
         return {
-            "timestamp":        self.timestamp,
-            "prompt":           self.prompt,
-            "retrieved_chunks": self.retrieved_chunks,
-            "response":         self.response,
-            "traits":           self.traits,
-            "scalar_reward":    self.scalar_reward,
+            "timestamp":     self.timestamp,
+            "prompt":        self.prompt,
+            "response":      self.response,
+            "traits":        self.traits,
+            "scalar_reward": self.scalar_reward,
         }
 
     @staticmethod
@@ -72,7 +70,6 @@ class InteractionLog:
         return InteractionLog(
             timestamp=d["timestamp"],
             prompt=d["prompt"],
-            retrieved_chunks=d.get("retrieved_chunks", []),
             response=d["response"],
             traits=d.get("traits", []),
             scalar_reward=d["scalar_reward"],

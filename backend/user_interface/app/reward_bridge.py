@@ -17,15 +17,16 @@ def compute_reward(scores: dict, traits: list[dict]) -> dict:
     Combine user-provided trait scores with their weights into a scalar reward.
 
     Args:
-        scores: dict mapping trait name -> numeric score, e.g.
-                {"clarity": 4, "empathy": 3, "directness": 5}
+        scores: dict mapping trait name -> numeric score on a -5 to +5 scale, e.g.
+                {"clarity": 3, "empathy": -2, "directness": 4}
+                Negative scores penalise the response; zero is neutral.
         traits: list of trait dicts from load_traits(), each with
                 keys: name, description, weight
 
     Returns:
         {
-            "contributions": {"clarity": 1.6, "empathy": 0.9, "directness": 1.5},
-            "scalar_reward": 4.0
+            "contributions": {"clarity": 1.2, "empathy": -0.6, "directness": 1.2},
+            "scalar_reward": 1.8
         }
 
     Raises:

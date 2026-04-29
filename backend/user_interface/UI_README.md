@@ -6,22 +6,18 @@
     ↓
     trait_manager.py loads traits into session
     ↓
-    rag_stub.py handles prompt → retrieval + generation
-    (mock now → real rag_system.pipeline.answer() later)
+    app.py (Streamlit) renders four pages via sidebar navigation:
+        Setup    — define / reweight reward traits
+        Grade    — enter prompt + response, score with sliders
+        History  — master-detail view of past scored interactions
+        Analytics — reward trend, trait breakdown, summary stats
     ↓
-    main.py (Streamlit) renders all panels:
-        - prompt input
-        - response display
-        - retrieved context (collapsible)
-        - traits editor (add / remove / reweight)
-        - scoring panel (manual scores per trait)
-        ↓
     reward_bridge.py computes scalar reward from manual scores
     reward = Σ(weight_i × score_i)
     ↓
-    interaction_logger.py appends full interaction to .jsonl
+    ui/storage.py appends full interaction to .jsonl
     ↓
-    history panel reads log and displays past interactions
+    History and Analytics pages read from the same log
 
 # trait config format
     - same format as reward_system/config/traits.json
@@ -55,68 +51,30 @@
     {
       "timestamp": "2026-04-10T14:32:01",
       "prompt": "What is reinforcement learning?",
-      "retrieved": [
-        {"text": "...", "source": "doc_3.txt"},
-        ...
-      ],
       "response": "Reinforcement learning is...",
       "traits": [
-        {"name": "clarity", "description": "...", "weight": 0.4},
+        {"name": "clarity", "score": 3, "weight": 0.4, "contribution": 1.2},
+        {"name": "empathy", "score": -2, "weight": 0.3, "contribution": -0.6},
         ...
       ],
-      "scores": {"clarity": 4, "empathy": 3, "directness": 5},
-      "scalar_reward": 3.9
+      "scalar_reward": 1.8
     }
+
+    Scores range from -5 (strong penalty) to +5 (strong reward); 0 is neutral.
+    Negative contributions reduce the scalar reward, driving the model away from
+    that trait in future training steps.
 
 # Implementation
 ## Milestones
 
-- **Milestone 1:** RAG stub (`app/rag_stub.py`)
-- **Milestone 2:** Trait manager + config (`config/traits.json`, `app/trait_manager.py`)
-- **Milestone 3:** Reward bridge (`app/reward_bridge.py`)
-- **Milestone 4:** Interaction logger (`app/interaction_logger.py`)
-- **Milestone 5:** Streamlit app entry point (`main.py`)
+- **Milestone 1:** Trait manager + config (`config/traits.json`, `app/trait_manager.py`)
+- **Milestone 2:** Reward bridge (`app/reward_bridge.py`)
+- **Milestone 3:** Interaction logger (`ui/storage.py`)
+- **Milestone 4:** Streamlit app (`app.py`, `ui/`)
 
 ---
 
-## Milestone 1: RAG Stub
-
-Stub out the RAG pipeline so the UI can be built and tested without the real RAG system.
-
-### What to create
-
-- `app/rag_stub.py` — a `answer(query, k=3) -> dict` function that returns mock output
-
-### What each does
-
-| Module | Function | Input | Output |
-|---|---|---|---|
-| `rag_stub.py` | `answer()` | query str, k int | `{"query": str, "retrieved": [...], "answer": str}` |
-
-### Example workflow after Milestone 1
-
-```python
-from app.rag_stub import answer
-
-result = answer("What is reinforcement learning?", k=3)
-
-print(result["answer"])
-# [Mock response] Here is a generated answer...
-
-for chunk in result["retrieved"]:
-    print(chunk["source"], chunk["text"][:40])
-# doc_7.txt   [Mock chunk 1] Retrieved passage...
-```
-
-### How to verify after Milestone 1
-
-```bash
-uv run python tests/test_milestones/toy_test_m1.py
-```
-
----
-
-## Milestone 2: Trait Manager + Config
+## Milestone 1: Trait Manager + Config
 
 Load and validate user-defined traits from the config file.
 Same format as `reward_system/config/traits.json` so both systems share a config convention.
@@ -132,7 +90,7 @@ Same format as `reward_system/config/traits.json` so both systems share a config
 |---|---|---|---|
 | `trait_manager.py` | `load_traits()` | Path to `traits.json` | List of trait dicts |
 
-### Example workflow after Milestone 2
+### Example workflow after Milestone 1
 
 ```python
 from app.trait_manager import load_traits
@@ -147,7 +105,7 @@ for t in traits:
 # directness 0.3
 ```
 
-### How to verify after Milestone 2
+### How to verify after Milestone 1
 
 ```bash
 uv run python tests/test_milestones/toy_test_m2.py
@@ -155,7 +113,7 @@ uv run python tests/test_milestones/toy_test_m2.py
 
 ---
 
-## Milestone 3: Reward Bridge
+## Milestone 2: Reward Bridge
 
 Compute the scalar reward from user-provided manual scores and trait weights.
 
@@ -181,22 +139,22 @@ Plugging into the same weighted-sum formula keeps the two systems compatible.
 scalar_reward = sum(trait["weight"] * scores[trait["name"]] for trait in traits)
 ```
 
-### Example workflow after Milestone 3
+### Example workflow after Milestone 2
 
 ```python
 from app.trait_manager import load_traits
 from app.reward_bridge import compute_reward
 
 traits = load_traits("config/traits.json")
-scores = {"clarity": 4, "empathy": 3, "directness": 5}
+scores = {"clarity": 3, "empathy": -2, "directness": 4}
 
 result = compute_reward(scores, traits)
 
-print(result["contributions"])  # {"clarity": 1.6, "empathy": 0.9, "directness": 1.5}
-print(result["scalar_reward"])  # 4.0
+print(result["contributions"])  # {"clarity": 1.2, "empathy": -0.6, "directness": 1.2}
+print(result["scalar_reward"])  # 1.8
 ```
 
-### How to verify after Milestone 3
+### How to verify after Milestone 2
 
 ```bash
 uv run python tests/test_milestones/toy_test_m3.py
@@ -204,19 +162,20 @@ uv run python tests/test_milestones/toy_test_m3.py
 
 ---
 
-## Milestone 4: Interaction Logger
+## Milestone 3: Interaction Logger
 
-Persist each scored interaction to a JSONL file for later RL / PPO training use.
+Persist each scored interaction to a JSONL file for later RL training use.
 
 ### What to create
 
-- `app/interaction_logger.py` — a `log_interaction(entry, log_path) -> None` function
+- `ui/storage.py` — `save_interaction(entry, log_path)` and `load_interactions(log_path)`
 
 ### What each does
 
 | Module | Function | Input | Output |
 |---|---|---|---|
-| `interaction_logger.py` | `log_interaction()` | full interaction dict + log path | Appends one JSON line to `logs/interaction_log.jsonl` |
+| `storage.py` | `save_interaction()` | InteractionLog + log path | Appends one JSON line to `.jsonl` |
+| `storage.py` | `load_interactions()` | log path | List of dicts, oldest first |
 
 ### Log entry format
 
@@ -224,49 +183,58 @@ Persist each scored interaction to a JSONL file for later RL / PPO training use.
 {
   "timestamp": "2026-04-10T14:32:01",
   "prompt": "What is reinforcement learning?",
-  "retrieved": [{"text": "...", "source": "doc_3.txt"}],
   "response": "Reinforcement learning is...",
-  "traits": [{"name": "clarity", "description": "...", "weight": 0.4}],
-  "scores": {"clarity": 4, "empathy": 3, "directness": 5},
-  "scalar_reward": 3.9
+  "traits": [{"name": "clarity", "score": 3, "weight": 0.4, "contribution": 1.2},
+             {"name": "empathy", "score": -2, "weight": 0.3, "contribution": -0.6}],
+  "scalar_reward": 1.8
 }
 ```
 
-### How to verify after Milestone 4
+Scores range from -5 (penalise) to +5 (reward); 0 is neutral.
+
+### How to verify after Milestone 3
 
 ```bash
-uv run python tests/test_milestones/toy_test_m4.py
+uv run python tests/test_milestones/toy_test_m5.py
 ```
-
-Check that `logs/interaction_log.jsonl` exists and contains a valid JSON line.
 
 ---
 
-## Milestone 5: Streamlit App
+## Milestone 4: Streamlit App
 
-Wire all modules into a running local UI.
+Wire all modules into a running local UI with four pages.
 
 ### What to create
 
-- `main.py` — Streamlit app with all 7 panels
+- `app.py` — entry point, sidebar navigation, page routing
+- `ui/components.py` — page and panel rendering functions
+- `ui/state.py` — session state management
+- `ui/types.py` — data models (TraitConfig, ScoredTrait, InteractionLog)
 
-### Panels
+### Pages
 
 ```text
-main.py
-  ├─ [1] Prompt input + Generate / Clear buttons
-  ├─ [2] Response display (with loading state)
-  ├─ [3] Retrieved context panel (collapsible)
-  ├─ [4] Traits editor (add / remove / set weight)
-  ├─ [5] Scoring panel (slider per trait → scalar reward)
-  ├─ [6] Save interaction button → interaction_logger
-  └─ [7] History panel (past saved interactions)
+app.py
+  ├─ Setup    — trait editor (add / remove / reweight)
+  ├─ Grade    — prompt text area + response text area
+  │               → scoring sliders per trait
+  │               → reward breakdown display
+  │               → save to JSONL button
+  ├─ History  — master-detail view of past interactions
+  └─ Analytics — reward trend chart, trait bar chart, summary stats
 ```
+
+### Grade page layout
+
+The Grade page has a draggable column divider (drag the vertical handle between
+the two columns to resize them). Left column: prompt and response input.
+Right column: scoring panel and save button.
 
 ### How to run
 
 ```bash
-uv run streamlit run main.py
+cd backend/user_interface
+uv run streamlit run app.py
 ```
 
 ---
@@ -275,4 +243,4 @@ uv run streamlit run main.py
 
 - Run individual milestone tests: `uv run python tests/test_milestones/toy_test_mX.py`
 - Tests are self-contained — each imports only the modules needed for that milestone
-- No external model or API required (RAG and scoring are mocked until swapped)
+- No external model or API required

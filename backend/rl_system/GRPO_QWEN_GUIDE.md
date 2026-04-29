@@ -1,9 +1,13 @@
-# GRPO + Qwen2.5-3B-Instruct Implementation Guide
+# GRPO + Qwen2.5 Implementation Guide
 
 ## Overview
 
 This guide covers how to upgrade the RL system from the manual PPO prototype
-(distilgpt2) to a GRPO-based training loop using Qwen2.5-3B-Instruct.
+(distilgpt2) to a GRPO-based training loop using Qwen2.5-Instruct.
+
+Two pre-built configurations are available in `config.py`:
+- `local_config()` — Qwen2.5-1.5B-Instruct, 4-bit QLoRA, for 4GB VRAM (GTX 1650)
+- `colab_config()` — Qwen2.5-3B-Instruct, bfloat16, for Google Colab T4 (15GB VRAM)
 
 **Why GRPO instead of PPO:**
 TRL 1.0.0 (the version in this project) removed `PPOTrainer`. The replacement
@@ -12,10 +16,10 @@ Instead of scoring one response and comparing it to a baseline, GRPO generates
 multiple responses to the same prompt and uses their relative reward scores as
 the training signal. This is lighter on memory and more stable to train.
 
-**Why Qwen2.5-3B-Instruct:**
-Qwen2.5-3B-Instruct is already instruction-tuned — it reliably follows prompts
+**Why Qwen2.5-Instruct:**
+Qwen2.5-Instruct models are already instruction-tuned — they reliably follow prompts
 like "rewrite this article to be more engaging" without any additional training.
-RLHF on top of it nudges the model toward your specific style preferences rather
+RLHF on top nudges the model toward your specific style preferences rather
 than teaching it to follow instructions from scratch, which is the correct and
 productive application of RLHF.
 
@@ -26,19 +30,24 @@ productive application of RLHF.
 ```
 Single prompt: "Rewrite this article to be engaging: [article text]"
         ↓
-Generate G responses (e.g. G=4):
-    Response A  →  you score with sliders  →  reward: 4.1
-    Response B  →  you score with sliders  →  reward: 2.3
-    Response C  →  you score with sliders  →  reward: 3.8
-    Response D  →  you score with sliders  →  reward: 1.9
+Generate G responses (G=2 locally, G=4 on Colab):
+    Response A  →  you score with sliders (-5 to +5)  →  reward: +2.1
+    Response B  →  you score with sliders (-5 to +5)  →  reward: -0.8
+    [Response C  →  reward: +1.4  ]  ← Colab only (G=4)
+    [Response D  →  reward: -1.3  ]  ← Colab only (G=4)
         ↓
 Advantage per response = reward - mean(all rewards)
-    A: +0.825   B: -1.775   C: +0.725   D: -1.175
+    (local G=2)  A: +1.45   B: -1.45
+    (colab G=4)  A: +1.725   B: -2.175   C: +1.025   D: -2.675
         ↓
 Clipped policy gradient update (same math as PPO, no critic model)
         ↓
-Model learns: A-style and C-style responses are preferred
+Model learns: A-style responses are preferred, B/D-style are penalised
 ```
+
+Sliders run from **-5** (actively penalise) to **+5** (strongly reward); **0** is neutral.
+Negative rewards are valid and useful — they push the model away from bad responses,
+which is stronger than just giving a low positive score.
 
 Your sliders and `compute_reward()` are called once per response. Nothing in
 the reward system changes.
@@ -47,19 +56,22 @@ the reward system changes.
 
 ## Memory Requirements and Solution
 
-Loading Qwen2.5-3B-Instruct twice (trainable + frozen reference) at full
-precision requires ~40-50GB VRAM — far beyond consumer hardware. The solution
-is **LoRA** (Low-Rank Adaptation).
+Loading a Qwen2.5 model twice (trainable + frozen reference) at full precision
+requires far more VRAM than consumer hardware provides. The solution is **LoRA**
+(Low-Rank Adaptation) — and optionally **4-bit quantization** for smaller GPUs.
 
-Instead of updating all 3 billion weights, LoRA attaches small trainable
-adapter matrices to specific layers. The rest of the model stays frozen.
-This reduces trainable parameters from 3B to roughly 10-30M, making training
-feasible on a single consumer GPU (12-24GB VRAM).
+Instead of updating all weights, LoRA attaches small trainable adapter matrices
+to specific layers. The rest of the model stays frozen.
 
 ```
-Full fine-tuning:   3,000,000,000 trainable parameters  ~40GB+
-LoRA fine-tuning:      20,000,000 trainable parameters  ~10-14GB
+                        Local (1.5B)        Colab (3B)
+Full fine-tuning:       ~20GB+ VRAM         ~40GB+ VRAM
+LoRA bfloat16:          ~4-6GB VRAM         ~10-14GB VRAM
+LoRA 4-bit QLoRA:       ~2.5-3.5GB VRAM     ~5-7GB VRAM
 ```
+
+`local_config()` uses 4-bit QLoRA to fit the 1.5B model on a 4GB GPU.
+`colab_config()` uses bfloat16 LoRA on the 3B model — Colab T4 has 15GB.
 
 The frozen reference model can be offloaded to CPU during training steps to
 save additional VRAM.
@@ -95,29 +107,55 @@ Create `backend/rl_system/grpo_system/config.py`:
 
 ```python
 from dataclasses import dataclass
+from typing import Tuple
 
 @dataclass
 class GRPOConfig:
     # Model
-    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    use_4bit: bool = True           # True = 4-bit QLoRA (local), False = bfloat16 (Colab)
 
     # LoRA
     lora_r: int = 16                # rank — higher = more capacity, more memory
     lora_alpha: int = 32            # scaling factor, usually 2x lora_r
     lora_dropout: float = 0.05
-    lora_target_modules: tuple = ("q_proj", "v_proj", "k_proj", "o_proj")
+    lora_target_modules: Tuple[str, ...] = ("q_proj", "v_proj", "k_proj", "o_proj")
 
     # GRPO
     learning_rate: float = 1e-5    # lower than PPO — model is already trained
-    num_generations: int = 4        # G — responses generated per prompt
-    max_prompt_length: int = 512
-    max_completion_length: int = 256
-    batch_size: int = 2             # prompts per step (each generates G responses)
+    num_generations: int = 2        # G — responses generated per prompt
+    max_prompt_length: int = 256
+    max_completion_length: int = 128
+    batch_size: int = 1             # prompts per step (each generates G responses)
     num_train_epochs: int = 1
     kl_coef: float = 0.1           # keeps policy close to reference
 
     # Output
     output_dir: str = "grpo_output"
+
+
+def local_config() -> GRPOConfig:
+    """GTX 1650 / 4GB VRAM laptop. 1.5B model with 4-bit QLoRA."""
+    return GRPOConfig(
+        model_name="Qwen/Qwen2.5-1.5B-Instruct",
+        use_4bit=True,
+        num_generations=2,
+        max_prompt_length=256,
+        max_completion_length=128,
+        batch_size=1,
+    )
+
+
+def colab_config() -> GRPOConfig:
+    """Google Colab T4 / 15GB VRAM. 3B model in bfloat16, full GRPO settings."""
+    return GRPOConfig(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
+        use_4bit=False,
+        num_generations=4,
+        max_prompt_length=512,
+        max_completion_length=256,
+        batch_size=2,
+    )
 ```
 
 ---
@@ -191,14 +229,18 @@ Create `backend/rl_system/grpo_system/model.py`:
 
 ```python
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType
 from grpo_system.config import GRPOConfig
 
 
 def load_model(config: GRPOConfig):
     """
-    Load Qwen2.5-3B-Instruct with LoRA adapters.
+    Load a Qwen2.5-Instruct model with LoRA adapters.
+
+    Respects config.use_4bit:
+      True  — 4-bit QLoRA (local 4GB GPU, e.g. GTX 1650)
+      False — bfloat16 (Colab T4/A100 with enough VRAM)
 
     Returns:
         model     — Qwen2.5 with LoRA layers attached (trainable)
@@ -211,12 +253,34 @@ def load_model(config: GRPOConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load base model — use bfloat16 to halve memory vs float32
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",      # automatically places layers across available GPU/CPU
-    )
+    has_gpu = torch.cuda.is_available()
+
+    if has_gpu and config.use_4bit:
+        print("  Hardware: GPU (4-bit QLoRA)")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+        )
+    elif has_gpu:
+        print("  Hardware: GPU (bfloat16)")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        print("  Hardware: CPU (float32)")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float32,
+            device_map=None,
+        )
 
     # Attach LoRA adapters — only these layers will receive gradient updates
     lora_config = LoraConfig(
@@ -229,7 +293,8 @@ def load_model(config: GRPOConfig):
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    # Expected output: trainable params: ~20M || all params: ~3B || trainable%: ~0.6%
+    # local:  trainable params: ~10M || all params: ~1.5B || trainable%: ~0.6%
+    # colab:  trainable params: ~20M || all params: ~3B   || trainable%: ~0.6%
 
     return model, tokenizer
 ```
@@ -313,7 +378,7 @@ Create `backend/rl_system/grpo_system/train.py`:
 Main GRPO training loop.
 
 Wires together:
-    - Qwen2.5-3B-Instruct + LoRA (model.py)
+    - Qwen2.5-Instruct + LoRA (model.py)
     - Newsgroup article prompts (data.py)
     - Human slider reward function (reward.py)
     - GRPOTrainer (trl)
@@ -322,7 +387,7 @@ Wires together:
 from datasets import Dataset
 from trl import GRPOConfig as TRLGRPOConfig, GRPOTrainer
 
-from grpo_system.config import GRPOConfig
+from grpo_system.config import GRPOConfig, local_config, colab_config
 from grpo_system.model import load_model
 from grpo_system.data import load_articles, format_for_qwen
 from grpo_system.reward import build_reward_fn
@@ -343,9 +408,9 @@ def get_scores_from_ui(prompt: str, response: str) -> dict:
 
 def train(config: GRPOConfig = None):
     if config is None:
-        config = GRPOConfig()
+        config = local_config()   # default to local; pass colab_config() on Colab
 
-    print("=== GRPO Training — Qwen2.5-3B-Instruct + LoRA ===")
+    print(f"=== GRPO Training — {config.model_name} + LoRA ===")
 
     # 1. Load model
     model, tokenizer = load_model(config)
@@ -383,7 +448,7 @@ def train(config: GRPOConfig = None):
     # 5. Train
     trainer.train()
 
-    # 6. Save LoRA adapters only (not full 3B model — adapters are ~80MB)
+    # 6. Save LoRA adapters only (base model is never re-saved)
     model.save_pretrained(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
     print(f"\nLoRA adapters saved to: {config.output_dir}/")
@@ -405,9 +470,9 @@ backend/rl_system/
 │   ├── trainer.py
 │   └── main.py
 │
-├── grpo_system/             # new GRPO system (Qwen2.5-3B-Instruct)
-│   ├── config.py            # GRPOConfig dataclass
-│   ├── model.py             # Qwen2.5 + LoRA loading
+├── grpo_system/             # GRPO system (Qwen2.5-1.5B local / 3B Colab)
+│   ├── config.py            # GRPOConfig + local_config() + colab_config()
+│   ├── model.py             # Qwen2.5 + LoRA loading (4-bit or bfloat16)
 │   ├── data.py              # newsgroup article prompt builder
 │   ├── reward.py            # bridges reward_system into GRPOTrainer
 │   └── train.py             # main training loop
@@ -426,9 +491,11 @@ data/raw/*.txt  →  RAG FAISS index  (retrieval context)
         ↓
 grpo_system/data.py  →  instruction prompts  (training input)
         ↓
-Qwen2.5-3B-Instruct generates G=4 responses per prompt
+Qwen2.5-Instruct generates G responses per prompt
+    local:  G=2, 1.5B model, 4-bit QLoRA
+    colab:  G=4, 3B model,   bfloat16
         ↓
-UI displays responses → user moves sliders
+UI displays responses → user moves sliders (-5 to +5 per trait)
         ↓
 reward_system/app/reward_fn.py  →  scalar per response  (unchanged)
         ↓
@@ -445,29 +512,32 @@ swapping the manual PPO loop and distilgpt2 for GRPOTrainer and Qwen2.5.
 
 ## Hardware Expectations
 
-| Setup | VRAM needed | Training speed |
-|---|---|---|
-| GPU with 24GB (e.g. RTX 3090/4090) | fits with LoRA + bfloat16 | ~2-5 min/step |
-| GPU with 12-16GB (e.g. RTX 3080) | tight — reduce batch_size to 1 | ~5-10 min/step |
-| CPU only | not recommended for 3B model | very slow |
-
-If VRAM is insufficient, add `load_in_4bit=True` to the `AutoModelForCausalLM`
-call in `model.py` via `BitsAndBytesConfig`. This halves VRAM at a small quality cost.
+| Setup | Config | VRAM needed | Training speed |
+|---|---|---|---|
+| GTX 1650 / 4GB laptop GPU | `local_config()` | ~3GB (4-bit QLoRA) | ~10-20 min/step |
+| Google Colab T4 (free) | `colab_config()` | ~10GB (bfloat16) | ~2-5 min/step |
+| RTX 3080/3090/4090 | `colab_config()` | ~10-14GB (bfloat16) | ~1-3 min/step |
+| CPU only | not recommended | N/A | very slow |
 
 ---
 
 ## Loading a Trained Model
 
-After training, load the LoRA adapters on top of the base model:
+After training, load the LoRA adapters on top of the same base model used for training:
 
 ```python
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 import torch
 
+# Use the same model name and quantization settings as your training config
+# local_config(): "Qwen/Qwen2.5-1.5B-Instruct" with 4-bit
+# colab_config(): "Qwen/Qwen2.5-3B-Instruct"   with bfloat16
+
+bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
 base_model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-3B-Instruct",
-    torch_dtype=torch.bfloat16,
+    "Qwen/Qwen2.5-1.5B-Instruct",  # or 3B if trained on Colab
+    quantization_config=bnb_config,  # omit if trained without 4-bit
     device_map="auto",
 )
 model = PeftModel.from_pretrained(base_model, "grpo_output/")

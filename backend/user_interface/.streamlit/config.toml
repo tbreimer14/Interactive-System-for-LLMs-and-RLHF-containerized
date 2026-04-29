@@ -1,0 +1,4 @@
+[server]
+# Stop Streamlit's file watcher from scanning .venv — it triggers hundreds of
+# ModuleNotFoundError warnings from transformers vision models that need torchvision.
+fileWatcherType = "none"
