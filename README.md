@@ -1,6 +1,6 @@
 # LLMTuner
 
-An interactive system for behavioral fine-tuning of language models through human feedback. Users define behavioral traits, score model responses with sliders, and trigger online GRPO training — all through a no-code Streamlit interface running on consumer GPU hardware.
+An interactive system for behavioral fine-tuning of language models through human feedback. Users define behavioral traits, score model responses with sliders, and trigger online GRPO training through a no-code Streamlit interface running on consumer GPU hardware.
 
 **Paper:** [LLMTuner: An Interactive System for Behavioral Fine-Tuning of Language Models Through Human Feedback](LLMTuner-Interactive_System_for_Behavioral_Fine_Tuning_of_LLMs_Through_Human_Feedback.pdf)
 
