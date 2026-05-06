@@ -7,8 +7,7 @@ Each session is a named directory under sessions/:
     sessions/
         default/
             interaction_log.jsonl
-            training_sessions.jsonl
-            grpo_output/
+            online_checkpoint/
         experiment_a/
             ...
 
@@ -57,5 +56,5 @@ def interaction_log_path(name: str) -> str:
     return str(session_dir(name) / "interaction_log.jsonl")
 
 
-def grpo_output_dir(name: str) -> str:
-    return str(session_dir(name) / "grpo_output")
+def online_checkpoint_dir(name: str) -> str:
+    return str(session_dir(name) / "online_checkpoint")

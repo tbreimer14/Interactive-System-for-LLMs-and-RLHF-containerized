@@ -2,14 +2,14 @@
 
 ## Overview
 
-This is a **GRPO-based RLHF fine-tuning system** for Qwen2.5-Instruct. Two configs are available: `local_config()` (1.5B, 4-bit QLoRA, GTX 1650) and `colab_config()` (3B, bfloat16, Google Colab T4). The core idea:
+This is a **GRPO-based online RLHF fine-tuning system** for Qwen2.5-Instruct. Two configs are available: `local_config()` (1.5B, 4-bit QLoRA, GTX 1650) and `colab_config()` (3B, bfloat16, Google Colab T4). The core idea:
 
-1. The model generates **G=4 responses** to the same instruction prompt (rewriting a newsgroup article)
+1. The model generates **G responses** to the same instruction prompt (rewriting a newsgroup article)
 2. The **user scores each response** using UI sliders, one score per trait
-3. The reward system converts those scores into a **scalar reward** per response
-4. GRPO computes **relative advantages** across the G responses (reward minus group mean)
+3. The reward system converts those scores into a **scalar reward per response** (true per-completion GRPO)
+4. After every 5 complete grading rounds, GRPO computes **relative advantages** across the G responses (reward minus group mean)
 5. A **policy gradient update** nudges the model toward responses the user rated higher
-6. Only **LoRA adapter weights** are saved — the 3B base model is never modified
+6. Only **LoRA adapter weights** are updated — the base model is never modified
 
 ### Why GRPO instead of PPO
 
@@ -26,19 +26,19 @@ Both model sizes (1.5B local, 3B Colab) are already instruction-tuned, so they f
     ↓
 grpo_system/data.py  →  instruction prompts formatted for Qwen2.5-Instruct
     ↓
-Qwen2.5-3B-Instruct + LoRA adapters (grpo_system/model.py)
+Qwen2.5-1.5B-Instruct + LoRA adapters (grpo_system/model.py)
+    shared model for both inference and online training
     generates G responses per prompt (G=2 locally, G=4 on Colab)
     ↓
-UI: user rates each response with sliders
-    ↓
-grpo_system/reward.py  →  reward_system/app/reward_fn.py  →  scalar per response
+UI: user rates each response with sliders (per-completion)
     reward = Σ(weight_i × user_score_i)
     ↓
-GRPOTrainer: advantage_i = reward_i − mean(rewards for this prompt)
+Every 3 complete rounds → grpo_system/online_step.py
+    advantage_i = (reward_i − mean(group)) / std(group)
+    policy gradient update on LoRA adapter weights (AdamW, in place)
+    KL reference via disable_adapter_layers() — no second model copy
     ↓
-Clipped policy gradient update on LoRA adapter weights
-    ↓
-grpo_output/  saves adapters (~80MB)
+Session page → Save Session → sessions/{name}/online_checkpoint/
 ```
 
 ---
@@ -111,7 +111,7 @@ GRPOTrainer calls:
                         Local (1.5B, 4-bit)     Colab (3B, bfloat16)
 Full fine-tuning:       ~20GB+ VRAM             ~40GB+ VRAM
 LoRA fine-tuning:       ~2.5-3.5GB VRAM         ~10-14GB VRAM
-Trainable params:       ~10M / 1.5B (0.6%)      ~20M / 3B (0.6%)
+Trainable params:       ~4.4M / 1.5B (0.3%)     ~8M / 3B (0.3%)
 ```
 
 **Loading details:**
@@ -171,55 +171,46 @@ GRPOTrainer then generates the completion (the article rewrite) from that point.
 
 ---
 
-### 5. **Training Loop** (`grpo_system/train.py`)
+### 5. **Online Training Step** (`grpo_system/online_step.py`)
 
-**Purpose:** Wire all modules together and run the GRPO training loop.
+**Purpose:** Perform one GRPO gradient update on the shared live model using a buffer of human-graded rounds. Called automatically from `OnlineGRPOSession.step()` after every 3 complete grading rounds.
 
-**Key Function:** `train(config: GRPOConfig = None)`
+**Key Function:** `grpo_step(model, tokenizer, groups, optimizer, beta=0.1)`
 
 **Step-by-step:**
 
 ```
-1. load_model(config)
-       → Qwen2.5-3B-Instruct + LoRA, tokenizer
+groups = [{prompt, completions: [{text, reward}, ...]}]  # 3 rounds
 
-2. load_articles() + format_for_qwen()
-       → HuggingFace Dataset with "prompt" column
+for each group:
+    rewards = [c["reward"] for c in completions]
+    advantages = (rewards − mean) / (std + ε)       # group-relative
+    for each (completion, advantage):
+        lp  = _seq_log_prob(model, prompt, text)     # LoRA active, grad flows
+        model.disable_adapter_layers()
+        ref = _seq_log_prob(model, prompt, text)     # base reference, no grad
+        model.enable_adapter_layers()
+        loss += −advantage × lp + beta × (lp − ref) # GRPO + KL
 
-3. build_reward_fn(get_scores_from_ui)
-       → reward_fn(prompts, completions) → list[float]
-
-4. GRPOTrainer(model, trl_config, dataset, reward_fn, tokenizer)
-       → configured trainer
-
-5. trainer.train()
-       → for each batch of prompts:
-           generate G=4 completions per prompt
-           call reward_fn → scalar per completion
-           compute advantages
-           policy gradient update on LoRA weights
-
-6. model.save_pretrained(output_dir)
-       → adapter_config.json
-       → adapter_model.safetensors
-       → tokenizer files
+torch.stack(loss_terms).mean().backward()
+optimizer.step()                                     # AdamW, LoRA params only
 ```
 
-**`get_scores_from_ui` placeholder:** The `train.py` stub raises `NotImplementedError` for this function. To run training, replace it with a real call to the UI score collector:
-```python
-def get_scores_from_ui(prompt: str, response: str) -> dict:
-    return ui_client.collect_scores(prompt, response)
-```
+The `disable_adapter_layers()` trick computes the KL reference using the same model object with adapters temporarily disabled — no second model instance needed.
 
-**TRL config fields passed to GRPOTrainer:**
+### 5b. **Standalone Batch Trainer** (`grpo_system/train.py`)
+
+A standalone script that reads a pre-built interaction log and runs TRL's `GRPOTrainer` in a full batch pass. Not wired to the UI — intended for offline runs on larger hardware (e.g., Colab T4 with the 3B model).
+
+**TRL config fields:**
 
 | Field | Value | Meaning |
 |---|---|---|
-| `num_generations` | 4 | G — responses per prompt |
+| `num_generations` | 2–4 | G — responses per prompt |
 | `kl_coef` | 0.1 | Penalty for drifting far from the reference model |
 | `bf16` | True | bfloat16 training |
 | `logging_steps` | 1 | Log loss/reward after every step |
-| `per_device_train_batch_size` | 2 | Prompts per GPU step (each yields G responses) |
+| `per_device_train_batch_size` | 1–2 | Prompts per GPU step |
 
 ---
 
@@ -233,14 +224,14 @@ The RL system uses the same `traits.json` as the reward system and UI — no sep
 
 ## Loading a Trained Model
 
-After training, the base model is unchanged. Only the LoRA adapters (`grpo_output/`) encode what was learned from slider ratings. Use the same model name and quantization settings as your training config.
+After training, the base model is unchanged. Only the LoRA adapters in `sessions/{name}/online_checkpoint/` encode what was learned from slider ratings. Use the same model name and quantization settings as your training config.
 
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 import torch
 
-# local_config() trained model:
+# local_config() trained model (4-bit QLoRA):
 bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
 base = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2.5-1.5B-Instruct",
@@ -248,21 +239,21 @@ base = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
 )
 
-# colab_config() trained model:
+# colab_config() trained model (bfloat16):
 # base = AutoModelForCausalLM.from_pretrained(
 #     "Qwen/Qwen2.5-3B-Instruct",
-#     torch_dtype=torch.bfloat16,
+#     dtype=torch.bfloat16,
 #     device_map="auto",
 # )
 
-model = PeftModel.from_pretrained(base, "grpo_output/")
-tokenizer = AutoTokenizer.from_pretrained("grpo_output/")
+model = PeftModel.from_pretrained(base, "sessions/my_session/online_checkpoint/")
+tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/online_checkpoint/")
 ```
 
-To permanently merge adapters into the base weights (optional, for deployment):
+To permanently merge adapters into the base weights (via Session page → Merge & Export, or manually):
 ```python
 merged = model.merge_and_unload()
-merged.save_pretrained("qwen_merged/")
+merged.save_pretrained("sessions/my_session/merged_model/")
 ```
 
 ---
@@ -409,18 +400,19 @@ backend/rl_system/
 ├── grpo_system/
 │   ├── __init__.py          # package marker
 │   ├── config.py            # GRPOConfig + local_config() + colab_config()
-│   ├── reward.py            # bridges reward_system into GRPOTrainer
+│   ├── reward.py            # bridges reward_system into GRPOTrainer (standalone use)
 │   ├── model.py             # Qwen2.5 + LoRA loading (4-bit or bfloat16)
+│   ├── online_step.py       # custom GRPO gradient step for online training
 │   ├── data.py              # newsgroup article prompt builder
-│   └── train.py             # main GRPO training loop
+│   └── train.py             # standalone batch training script (not wired to UI)
 ├── tests/
 │   └── test_milestones/
 │       ├── toy_test_m1.py   # Config tests
 │       ├── toy_test_m2.py   # Reward function tests
 │       ├── toy_test_m3.py   # Model + LoRA tests
 │       ├── toy_test_m4.py   # Prompt builder tests
-│       └── toy_test_m5.py   # Training loop tests
-├── grpo_output/             # created after training — LoRA adapters
+│       ├── toy_test_m5.py   # Batch training loop tests
+│       └── toy_test_m6.py   # Online step tests
 ├── GRPO_QWEN_GUIDE.md       # implementation guide (code-level)
 ├── RL_README.md             # pipeline overview + milestone breakdown
 └── RL_DOCUMENTATION.md      # complete documentation (this file)

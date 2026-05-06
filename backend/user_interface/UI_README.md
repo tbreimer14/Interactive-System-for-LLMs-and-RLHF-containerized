@@ -1,236 +1,171 @@
 # User Interface
 
-# UI pipeline overview
+## Pipeline
 
-    traits.json (user-defined config)
-    ↓
-    trait_manager.py loads traits into session
-    ↓
-    app.py (Streamlit) renders four pages via sidebar navigation:
-        Setup    — define / reweight reward traits
-        Grade    — enter prompt + response, score with sliders
-        History  — master-detail view of past scored interactions
-        Analytics — reward trend, trait breakdown, summary stats
-    ↓
-    reward_bridge.py computes scalar reward from manual scores
-    reward = Σ(weight_i × score_i)
-    ↓
-    ui/storage.py appends full interaction to .jsonl
-    ↓
-    History and Analytics pages read from the same log
+```
+traits.json (user-defined config)
+  ↓
+trait_manager.py loads traits into session
+  ↓
+app.py (Streamlit) auto-loads online checkpoint for active session (once per startup)
+  ↓
+app.py renders 6 pages via sidebar navigation:
+    Setup    — define / reweight reward traits
+    Prompt   — browse 20 Newsgroups, set article + instruction
+    Grade    — generate responses, set length, score per trait, online GRPO training
+    History  — master-detail view of past scored interactions
+    Analytics — reward trend, trait breakdown, summary stats
+    Session  — save/load online LoRA weights + export trained model
+  ↓
+reward_bridge.py computes scalar reward from slider scores
+reward = Σ(weight_i × score_i)
+  ↓
+ui/storage.py appends full interaction to interaction_log.jsonl
+  ↓
+[Every 3 complete grading rounds on the Grade page]
+  OnlineGRPOSession.step() fires in background thread
+  LoRA weights updated in place on the shared model
+  ↓
+[When happy with the model]
+  Session page → Save Session → Export (ZIP or Merge)
+```
 
-# trait config format
-    - same format as reward_system/config/traits.json
-    - traits are defined by the user in config/traits.json
-    - each trait has: name, description, weight
-    → stored as a list of dicts:
+---
 
+## Online Training Flow (Grade Page)
+
+A **round** = one prompt with all its generated responses, fully scored and saved.
+
+```
+Generate 2–4 responses  →  round starts (0/N saved)
+  Save Response A       →  (1/N saved)  + buffered: {text, reward}
+  Save Response B       →  (2/N saved)  round complete → buffer: 1/3
+  [repeat for 3 rounds]
+Buffer hits 3 rounds    →  OnlineGRPOSession.step(buffer)
+                            background thread, ~30s on GTX 1650
+                            AdamW updates LoRA weights in place
+                        →  "Generate Responses" re-enabled
+                        →  next generation uses updated model
+```
+
+The status banner at the top of the Grade page shows:
+- How many rounds are buffered (X/3)
+- When a training step is in progress
+- Step count and last loss after each completed step
+
+---
+
+## Response Length
+
+The Grade page has a **response length slider** (25–400 words, step 25). The chosen target is appended as a soft instruction to the generation prompt only — the original prompt without the length hint is saved to the log and the round buffer.
+
+---
+
+## Session Page
+
+The Session page replaces a manual batch training step. It gives you control over when trained weights are persisted and exported.
+
+| Action | What it does |
+|---|---|
+| **Save Session** | Writes current LoRA weights to `sessions/{name}/online_checkpoint/` |
+| **Load Saved Weights** | Restores weights from the checkpoint into the live model |
+| **Download Adapters ZIP** | ZIPs the checkpoint directory for download |
+| **Merge & Export Full Model** | Merges LoRA into base weights and saves a standalone model |
+
+> Export always reads from the saved checkpoint on disk — **Save Session before exporting**.
+
+**Auto-load:** On startup (or session switch), the app checks for an existing checkpoint and loads it automatically. This restores your training progress from where you left off without any manual step.
+
+---
+
+## Trait Config Format
+
+```json
+{
+  "traits": [
     {
-      "traits": [
-        {
-          "name": "clarity",
-          "description": "The response is easy to read and well-structured",
-          "weight": 0.4
-        },
-        {
-          "name": "empathy",
-          "description": "Acknowledges the user's situation and sounds human",
-          "weight": 0.3
-        },
-        {
-          "name": "directness",
-          "description": "Gets to the point without unnecessary padding",
-          "weight": 0.3
-        }
-      ]
-    }
-
-# interaction log format
-    Each saved interaction is one JSON line in logs/interaction_log.jsonl:
-
+      "name": "clarity",
+      "description": "The response is easy to read and well-structured",
+      "weight": 0.4
+    },
     {
-      "timestamp": "2026-04-10T14:32:01",
-      "prompt": "What is reinforcement learning?",
-      "response": "Reinforcement learning is...",
-      "traits": [
-        {"name": "clarity", "score": 3, "weight": 0.4, "contribution": 1.2},
-        {"name": "empathy", "score": -2, "weight": 0.3, "contribution": -0.6},
-        ...
-      ],
-      "scalar_reward": 1.8
+      "name": "empathy",
+      "description": "Acknowledges the user's situation and sounds human",
+      "weight": 0.3
+    },
+    {
+      "name": "directness",
+      "description": "Gets to the point without unnecessary padding",
+      "weight": 0.3
     }
+  ]
+}
+```
 
-    Scores range from -5 (strong penalty) to +5 (strong reward); 0 is neutral.
-    Negative contributions reduce the scalar reward, driving the model away from
-    that trait in future training steps.
-
-# Implementation
-## Milestones
-
-- **Milestone 1:** Trait manager + config (`config/traits.json`, `app/trait_manager.py`)
-- **Milestone 2:** Reward bridge (`app/reward_bridge.py`)
-- **Milestone 3:** Interaction logger (`ui/storage.py`)
-- **Milestone 4:** Streamlit app (`app.py`, `ui/`)
+Same format as `reward_system/config/traits.json` — both systems share this convention.
 
 ---
 
-## Milestone 1: Trait Manager + Config
+## Interaction Log Format
 
-Load and validate user-defined traits from the config file.
-Same format as `reward_system/config/traits.json` so both systems share a config convention.
-
-### What to create
-
-- `config/traits.json` — default trait definitions (name, description, weight)
-- `app/trait_manager.py` — `load_traits(config_path) -> list[dict]`
-
-### What each does
-
-| Module | Function | Input | Output |
-|---|---|---|---|
-| `trait_manager.py` | `load_traits()` | Path to `traits.json` | List of trait dicts |
-
-### Example workflow after Milestone 1
-
-```python
-from app.trait_manager import load_traits
-
-traits = load_traits("config/traits.json")
-
-for t in traits:
-    print(t["name"], t["weight"])
-
-# clarity    0.4
-# empathy    0.3
-# directness 0.3
-```
-
-### How to verify after Milestone 1
-
-```bash
-uv run python tests/test_milestones/toy_test_m2.py
-```
-
----
-
-## Milestone 2: Reward Bridge
-
-Compute the scalar reward from user-provided manual scores and trait weights.
-
-### What to create
-
-- `app/reward_bridge.py` — a `compute_reward(scores, traits) -> dict` function
-
-### Design note
-
-Unlike `reward_system/reward_fn.py` which calls a scorer automatically,
-the UI reward bridge takes **user-provided scores** (from the UI sliders).
-Plugging into the same weighted-sum formula keeps the two systems compatible.
-
-### What each does
-
-| Module | Function | Input | Output |
-|---|---|---|---|
-| `reward_bridge.py` | `compute_reward()` | scores dict + traits list | `{"contributions": {...}, "scalar_reward": float}` |
-
-### Reward formula
-
-```
-scalar_reward = sum(trait["weight"] * scores[trait["name"]] for trait in traits)
-```
-
-### Example workflow after Milestone 2
-
-```python
-from app.trait_manager import load_traits
-from app.reward_bridge import compute_reward
-
-traits = load_traits("config/traits.json")
-scores = {"clarity": 3, "empathy": -2, "directness": 4}
-
-result = compute_reward(scores, traits)
-
-print(result["contributions"])  # {"clarity": 1.2, "empathy": -0.6, "directness": 1.2}
-print(result["scalar_reward"])  # 1.8
-```
-
-### How to verify after Milestone 2
-
-```bash
-uv run python tests/test_milestones/toy_test_m3.py
-```
-
----
-
-## Milestone 3: Interaction Logger
-
-Persist each scored interaction to a JSONL file for later RL training use.
-
-### What to create
-
-- `ui/storage.py` — `save_interaction(entry, log_path)` and `load_interactions(log_path)`
-
-### What each does
-
-| Module | Function | Input | Output |
-|---|---|---|---|
-| `storage.py` | `save_interaction()` | InteractionLog + log path | Appends one JSON line to `.jsonl` |
-| `storage.py` | `load_interactions()` | log path | List of dicts, oldest first |
-
-### Log entry format
+Each saved interaction is one JSON line in `sessions/<name>/interaction_log.jsonl`:
 
 ```json
 {
   "timestamp": "2026-04-10T14:32:01",
-  "prompt": "What is reinforcement learning?",
-  "response": "Reinforcement learning is...",
-  "traits": [{"name": "clarity", "score": 3, "weight": 0.4, "contribution": 1.2},
-             {"name": "empathy", "score": -2, "weight": 0.3, "contribution": -0.6}],
+  "prompt": "Rewrite the following article to be more engaging...",
+  "response": "The response text generated by the model...",
+  "traits": [
+    {"name": "clarity",   "score": 3, "weight": 0.4, "contribution":  1.2},
+    {"name": "empathy",   "score": -2, "weight": 0.3, "contribution": -0.6},
+    {"name": "directness","score": 4, "weight": 0.3, "contribution":  1.2}
+  ],
   "scalar_reward": 1.8
 }
 ```
 
-Scores range from -5 (penalise) to +5 (reward); 0 is neutral.
-
-### How to verify after Milestone 3
-
-```bash
-uv run python tests/test_milestones/toy_test_m5.py
-```
+Scores range from −5 (strong penalty) to +5 (strong reward). 0 is neutral.
 
 ---
 
-## Milestone 4: Streamlit App
+## Key Modules
 
-Wire all modules into a running local UI with four pages.
+| Module | Responsibility |
+|---|---|
+| `app.py` | Entry point, sidebar nav, auto-load checkpoint, session routing |
+| `backend_adapter.py` | Shared model (inference + online training), reward |
+| `grpo_adapter.py` | `OnlineGRPOSession`, checkpoint save/load, export helpers |
+| `app/trait_manager.py` | Load traits from `config/traits.json` |
+| `app/reward_bridge.py` | Weighted sum scalar reward from UI slider scores |
+| `ui/components.py` | All 6 page renderers + panel helpers |
+| `ui/state.py` | All `st.session_state` keys and accessors |
+| `ui/storage.py` | JSONL append / read |
+| `ui/types.py` | `TraitConfig`, `ScoredTrait`, `InteractionLog` |
+| `ui/session_manager.py` | Per-experiment directory isolation + path helpers |
 
-### What to create
+---
 
-- `app.py` — entry point, sidebar navigation, page routing
-- `ui/components.py` — page and panel rendering functions
-- `ui/state.py` — session state management
-- `ui/types.py` — data models (TraitConfig, ScoredTrait, InteractionLog)
+## Session Isolation
 
-### Pages
+Each named session has its own directory:
 
-```text
-app.py
-  ├─ Setup    — trait editor (add / remove / reweight)
-  ├─ Grade    — prompt text area + response text area
-  │               → scoring sliders per trait
-  │               → reward breakdown display
-  │               → save to JSONL button
-  ├─ History  — master-detail view of past interactions
-  └─ Analytics — reward trend chart, trait bar chart, summary stats
+```
+sessions/
+  default/
+    interaction_log.jsonl       ← all graded interactions
+    online_checkpoint/          ← saved LoRA weights (written by Save Session)
+  demo_session/
+    ...
 ```
 
-### Grade page layout
+Switching sessions in the sidebar:
+1. Resets all in-memory state (history, round buffer, optimizer)
+2. Zeros the LoRA B matrices (restores base model behavior)
+3. Auto-loads the new session's checkpoint if one exists
 
-The Grade page has a draggable column divider (drag the vertical handle between
-the two columns to resize them). Left column: prompt and response input.
-Right column: scoring panel and save button.
+---
 
-### How to run
+## Running
 
 ```bash
 cd backend/user_interface
@@ -239,8 +174,15 @@ uv run streamlit run app.py
 
 ---
 
-# Testing
+## Milestones
 
-- Run individual milestone tests: `uv run python tests/test_milestones/toy_test_mX.py`
-- Tests are self-contained — each imports only the modules needed for that milestone
-- No external model or API required
+- **Milestone 1:** Trait manager + config (`config/traits.json`, `app/trait_manager.py`)
+- **Milestone 2:** Reward bridge (`app/reward_bridge.py`)
+- **Milestone 3:** Interaction logger (`ui/storage.py`)
+- **Milestone 4:** Streamlit app — 6 pages (`app.py`, `ui/`)
+
+### How to verify
+
+```bash
+uv run python tests/test_milestones/toy_test_mX.py
+```

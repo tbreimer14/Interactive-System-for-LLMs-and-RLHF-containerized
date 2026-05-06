@@ -27,3 +27,12 @@ Thumbs.db
 .env
 .env.local
 *.log
+
+# Paper Specific
+diagrams/
+paper/
+
+# Sessions - ignore all except default and demo_session
+backend/user_interface/sessions/*
+!backend/user_interface/sessions/default/
+!backend/user_interface/sessions/demo_session/

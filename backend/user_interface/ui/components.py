@@ -4,18 +4,21 @@ ui/components.py
 Page-level layout functions and reusable panel helpers.
 
 Page functions (called from app.py):
-    setup_page()                  -> Page 1: trait definition
-    prompt_page()                 -> Page 2: dataset browser + prompt editing
-    score_page(adapter, log_path) -> Page 3: response input + reward scoring
-    history_page()                -> Page 4: master-detail history view
-    analytics_page()              -> Page 5: tabbed reward analytics
-    train_page(log_path)          -> Page 6: GRPO fine-tuning on saved interactions
+    setup_page()                              -> Page 1: trait definition
+    prompt_page()                             -> Page 2: dataset browser + prompt editing
+    score_page(adapter, log_path)             -> Page 3: generate, grade, online GRPO
+    history_page()                            -> Page 4: master-detail history view
+    analytics_page()                          -> Page 5: tabbed reward analytics
+    session_page(log_path, checkpoint_dir)    -> Page 6: save/load weights + export
 
-Internal panel helpers (composed by page functions):
+Online training helpers (called from score_page):
+    _trigger_online_step(groups)   -> get/create OnlineGRPOSession, fire step
+
+Internal panel helpers:
     _traits_editor()
     _dataset_loader()
     _dataset_picker()
-    _scoring_panel(adapter)
+    _scoring_panel(adapter, suffix)
     _save_panel(scored_traits, scalar_reward, prompt, response, log_path)
     _inject_column_resizer()
 """
@@ -165,12 +168,42 @@ def prompt_page() -> None:
         st.caption("Fill in the fields above and click **Set Prompt**.")
 
 
+def _trigger_online_step(groups: list[dict]) -> None:
+    """Get or create the OnlineGRPOSession and fire one training step."""
+    from grpo_adapter import OnlineGRPOSession
+    from backend_adapter import get_shared_model
+
+    session = state.get_online_session()
+    if session is None:
+        model, tokenizer = get_shared_model()
+        session = OnlineGRPOSession(model, tokenizer)
+        state.set_online_session(session)
+
+    session.step(groups)
+
+
 # ==============================================================================
 # Page 3: Grade — response input + reward scoring
 # ==============================================================================
 
 def score_page(adapter, log_path: str) -> None:
     st.header("Grade")
+
+    # ── Online training status banner ──────────────────────────────────────────
+    online = state.get_online_session()
+    if online is not None:
+        buf_n = len(state.get_grading_buffer())
+        if online.is_stepping:
+            st.info(f"Training step {online.steps + 1} in progress — model updating…")
+        elif online.error:
+            st.error(f"Online training error: {online.error}")
+        elif online.steps > 0:
+            st.success(
+                f"Model updated ({online.steps} step{'s' if online.steps > 1 else ''} done, "
+                f"last loss={online.last_loss:.4f})  —  {buf_n}/3 rounds buffered"
+            )
+        else:
+            st.caption(f"Online GRPO active — {buf_n}/3 rounds buffered")
 
     article = st.session_state.get("article_input", "").strip()
     task    = st.session_state.get("task_input", "").strip()
@@ -189,7 +222,7 @@ def score_page(adapter, log_path: str) -> None:
     else:
         st.info("No prompt set. Go to **Prompt** page to choose one.")
 
-    col_n, col_gen, col_clear = st.columns([2, 2, 1])
+    col_n, col_len, col_gen, col_clear = st.columns([2, 3, 2, 1])
     with col_n:
         num = st.radio(
             "Responses",
@@ -201,20 +234,44 @@ def score_page(adapter, log_path: str) -> None:
         if num != state.get_num_responses():
             state.set_num_responses(num)
             st.rerun()
+    with col_len:
+        target_words = st.slider(
+            "Response length (words)",
+            min_value=25,
+            max_value=400,
+            value=state.get_response_length(),
+            step=25,
+            help="Appended to the prompt as a soft instruction — the model aims for this length but won't be hard-cut.",
+        )
+        if target_words != state.get_response_length():
+            state.set_response_length(target_words)
+        st.caption(f"≈ {target_words * 5:,} chars")
     with col_gen:
-        if st.button("Generate Responses", type="primary", use_container_width=True):
-            responses = adapter.generate_responses(combined_prompt, num)
+        online = state.get_online_session()
+        gen_disabled = online is not None and online.is_stepping
+        if st.button(
+            "Generate Responses", type="primary",
+            use_container_width=True, disabled=gen_disabled,
+        ):
+            length_hint = f"\n\nAim for roughly {target_words} words in your response."
+            generation_prompt = combined_prompt + length_hint
+            responses = adapter.generate_responses(generation_prompt, num)
+            st.session_state["_gen_texts"] = responses  # plain key, not widget-owned
             for i, text in enumerate(responses):
                 st.session_state[f"response_input_{i}"] = text
                 st.session_state[f"saved_{i}"] = False
+            state.init_current_round(combined_prompt, num)
             st.rerun()
     with col_clear:
         if st.button("Clear All", use_container_width=True):
+            st.session_state.pop("_gen_texts", None)
             state.clear()
             st.rerun()
 
     labels = ["A", "B", "C", "D"]
     summary: dict[str, float] = {}
+
+    _gen_texts = st.session_state.get("_gen_texts", [])
 
     for i in range(num):
         label = labels[i]
@@ -223,6 +280,10 @@ def score_page(adapter, log_path: str) -> None:
 
         response_key = f"response_input_{i}"
         saved_key    = f"saved_{i}"
+
+        # Restore widget key from backup if Streamlit cleaned it up mid-rerun
+        if not st.session_state.get(response_key) and i < len(_gen_texts):
+            st.session_state[response_key] = _gen_texts[i]
 
         st.text_area(
             f"Response {label}",
@@ -259,6 +320,17 @@ def score_page(adapter, log_path: str) -> None:
                     st.session_state[saved_key] = True
                     state.mark_saved()
                     state.append_history(entry.to_dict())
+
+                    # Online round buffer
+                    state.add_to_current_round(response_text, scalar_reward)
+                    if state.is_current_round_complete():
+                        completed = state.pop_current_round()
+                        state.add_to_grading_buffer(completed)
+                        buf = state.get_grading_buffer()
+                        if len(buf) >= 3:
+                            _trigger_online_step(buf)
+                            state.clear_grading_buffer()
+
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to save: {e}")
@@ -383,7 +455,7 @@ def analytics_page() -> None:
         rewards = [e.get("scalar_reward", 0) for e in entries]
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Sessions", len(entries))
+            st.metric("Total Graded Responses", len(entries))
         with col2:
             st.metric("Avg Reward", f"{sum(rewards) / len(rewards):.3f}")
         with col3:
@@ -668,125 +740,101 @@ def _inject_column_resizer() -> None:
 
 
 # ==============================================================================
-# Page 6: Train — GRPO fine-tuning on saved interactions
+# Page 6: Session — save/load online training progress + export
 # ==============================================================================
 
-def train_page(log_path: str, grpo_output_dir: str = "grpo_output") -> None:
-    from pathlib import Path as _Path
+def session_page(log_path: str, checkpoint_dir: str) -> None:
     from grpo_adapter import (
-        GRPOSession, load_scored_prompts, load_session_records,
+        save_online_checkpoint, load_online_checkpoint,
         zip_adapter_dir, merge_and_export,
     )
+    from backend_adapter import get_shared_model
 
     active_session = state.get_active_session()
+    online         = state.get_online_session()
+    ckpt_exists    = Path(checkpoint_dir).exists()
 
-    st.header("GRPO Training")
-    st.caption(
-        f"Session: **{active_session}** — fine-tune Qwen2.5 on saved interactions using GRPO. "
-        "Grade responses on the **Grade** page first to build up training data."
-    )
+    st.header(f"Session: {active_session}")
 
-    # ── Data summary ────────────────────────────────────────────────────────────
-    prompt_reward_map = load_scored_prompts(log_path)
-    n_prompts = len(prompt_reward_map)
-    session   = state.get_grpo_session()
-
+    # ── Stats ───────────────────────────────────────────────────────────────────
+    history = state.get_history()
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        st.metric("Scored Prompts", n_prompts)
+        st.metric("Graded Responses", len(history))
     with col_b:
-        rewards = list(prompt_reward_map.values())
+        rewards = [e.get("scalar_reward", 0) for e in history]
         st.metric("Avg Reward", f"{sum(rewards)/len(rewards):.3f}" if rewards else "—")
     with col_c:
-        st.metric("Last Run", session.status if session else "none")
+        steps = online.steps if online else 0
+        st.metric("Online Training Steps", steps)
 
-    if n_prompts == 0:
-        st.info("No training data yet. Go to **Grade**, score some responses, and save them.")
-        _past_sessions_panel(load_session_records, log_path)
-        return
+    if online and online.steps > 0:
+        st.caption(f"Last loss: {online.last_loss:.4f}")
 
     st.divider()
 
-    # ── Config ──────────────────────────────────────────────────────────────────
-    st.subheader("Training Config")
-    col_ep, col_note = st.columns([1, 3])
-    with col_ep:
-        num_epochs = st.number_input("Epochs", min_value=1, max_value=10, value=1, step=1)
-    with col_note:
-        st.caption(
-            f"Model: Qwen/Qwen2.5-1.5B-Instruct + LoRA  \n"
-            f"Adapters → `{grpo_output_dir}/`"
-        )
-
-    # ── Controls ────────────────────────────────────────────────────────────────
-    training_active = session is not None and not session.done
-
-    col_start, col_refresh = st.columns([1, 1])
-    with col_start:
-        if st.button(
-            "Start Training", type="primary",
-            use_container_width=True, disabled=training_active,
-        ):
-            new_session = GRPOSession(
-                log_path=log_path,
-                num_epochs=int(num_epochs),
-                adapter_dir=grpo_output_dir,
-            )
-            new_session.start()
-            state.set_grpo_session(new_session)
-            st.rerun()
-    with col_refresh:
-        if training_active and st.button("Refresh Log", use_container_width=True):
-            st.rerun()
-
-    # ── Progress log ────────────────────────────────────────────────────────────
-    session = state.get_grpo_session()
-    if session is not None:
-        st.divider()
-        st.subheader("Training Log")
-
-        _STATUS_COLOR = {
-            "idle": "gray", "loading": "blue", "training": "orange",
-            "done": "green", "error": "red",
-        }
-        color = _STATUS_COLOR.get(session.status, "gray")
-        st.markdown(f"**Status:** :{color}[{session.status.upper()}]")
-
-        if session.error:
-            st.error(session.error)
-        if session.output_dir:
-            st.success(f"LoRA adapters saved to `{session.output_dir}/`")
-
-        log_text = "\n".join(session.log) if session.log else "Waiting…"
-        st.code(log_text, language=None)
-
-        if training_active:
-            st.caption("Click **Refresh Log** to see latest progress.")
-
-    # ── Export ──────────────────────────────────────────────────────────────────
-    adapter_dir = (
-        (session.output_dir if session and session.output_dir else None)
-        or (grpo_output_dir if _Path(grpo_output_dir).exists() else None)
+    # ── Save / Load ─────────────────────────────────────────────────────────────
+    st.subheader("Save & Load Progress")
+    st.caption(
+        "Saving writes the current LoRA adapter weights to this session's folder. "
+        "They reload automatically next time you start the app."
     )
 
-    if adapter_dir and _Path(adapter_dir).exists():
+    col_save, col_load = st.columns(2)
+    with col_save:
+        save_disabled = online is None or online.steps == 0 or online.is_stepping
+        if st.button(
+            "Save Session", type="primary",
+            use_container_width=True, disabled=save_disabled,
+            help="Saves LoRA weights to sessions/{name}/online_checkpoint/",
+        ):
+            model, tokenizer = get_shared_model()
+            with st.spinner("Saving…"):
+                save_online_checkpoint(model, tokenizer, checkpoint_dir)
+            st.success(f"Saved to `{checkpoint_dir}`")
+
+    with col_load:
+        if st.button(
+            "Load Saved Weights", use_container_width=True,
+            disabled=not ckpt_exists,
+            help=f"`{checkpoint_dir}`" if ckpt_exists else "No checkpoint saved for this session yet.",
+        ):
+            model, _ = get_shared_model()
+            with st.spinner("Loading…"):
+                load_online_checkpoint(model, checkpoint_dir)
+            st.success("Weights loaded — model is ready.")
+
+    if ckpt_exists:
+        st.caption(f"Checkpoint: `{checkpoint_dir}`")
+    else:
+        st.caption("No checkpoint saved yet for this session.")
+
+    # ── Online training log ─────────────────────────────────────────────────────
+    if online and online.log:
+        st.divider()
+        st.subheader("Online Training Log")
+        st.code("\n".join(online.log), language=None)
+
+    # ── Export ──────────────────────────────────────────────────────────────────
+    if ckpt_exists:
         st.divider()
         st.subheader("Export")
+        st.caption("Export the trained model from your saved checkpoint.")
 
         tab_zip, tab_merge = st.tabs(["Download Adapters (ZIP)", "Merge & Export Full Model"])
 
         with tab_zip:
             st.caption(
-                "Download the LoRA adapter files. "
+                "Download the LoRA adapter files (~80MB). "
                 "Load with `PeftModel.from_pretrained(base_model, adapter_dir)`."
             )
             if st.button("Prepare ZIP", use_container_width=True):
-                with st.spinner("Zipping adapter files…"):
-                    zip_bytes = zip_adapter_dir(adapter_dir)
+                with st.spinner("Zipping…"):
+                    zip_bytes = zip_adapter_dir(checkpoint_dir)
                 st.download_button(
                     label="Download adapters.zip",
                     data=zip_bytes,
-                    file_name="grpo_adapters.zip",
+                    file_name=f"{active_session}_adapters.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
@@ -794,41 +842,16 @@ def train_page(log_path: str, grpo_output_dir: str = "grpo_output") -> None:
         with tab_merge:
             st.caption(
                 "Merge LoRA weights into the base model and save a standalone model — "
-                "no PEFT needed to load the result."
+                "no PEFT needed to load the result (~3GB)."
             )
-            merge_out = st.text_input("Output directory", value="grpo_merged_model", key="merge_out_dir")
+            default_out = str(Path(checkpoint_dir).parent / "merged_model")
+            merge_out = st.text_input("Output directory", value=default_out, key="merge_out_dir")
             if st.button("Merge & Save", type="primary", use_container_width=True):
-                with st.spinner(f"Merging LoRA into base weights and saving to {merge_out}/…"):
+                with st.spinner(f"Merging into {merge_out}/…"):
                     try:
-                        merge_and_export(adapter_dir, merge_out)
+                        merge_and_export(checkpoint_dir, merge_out)
                         st.success(f"Merged model saved to `{merge_out}/`")
                     except Exception as e:
                         st.error(f"Merge failed: {e}")
 
-    # ── Past sessions ────────────────────────────────────────────────────────────
-    _past_sessions_panel(load_session_records, log_path)
 
-
-def _past_sessions_panel(load_fn, log_path: str) -> None:
-    records = load_fn(log_path)
-    if not records:
-        return
-
-    st.divider()
-    st.subheader("Past Sessions")
-
-    for rec in records:
-        ts      = rec.get("timestamp", "")[:16]
-        status  = rec.get("status", "?")
-        epochs  = rec.get("num_epochs", "?")
-        n_p     = rec.get("n_prompts", "?")
-        out_dir = rec.get("output_dir") or "—"
-        label   = f"{ts}  ·  {status.upper()}  ·  {n_p} prompts  ·  {epochs} epoch(s)"
-
-        with st.expander(label, expanded=False):
-            st.caption(f"Adapters: `{out_dir}`")
-            if rec.get("error"):
-                st.error(rec["error"])
-            log_lines = rec.get("log", [])
-            if log_lines:
-                st.code("\n".join(log_lines), language=None)

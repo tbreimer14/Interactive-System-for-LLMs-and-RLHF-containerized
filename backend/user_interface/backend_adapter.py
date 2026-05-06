@@ -3,43 +3,49 @@ backend_adapter.py
 
 Single point of contact between the UI and the backend modules.
 
-generate_responses() loads Qwen2.5-1.5B-Instruct once via @st.cache_resource
-and runs inference with the model's chat template.
+generate_responses() loads Qwen2.5 + LoRA once via @st.cache_resource and runs
+inference. The same model object is used for online GRPO training — LoRA weights
+are updated in place, so the next generate_responses() call automatically uses
+the refined model.
+
 compute_reward() calls reward_bridge directly (no network hop needed).
 """
 
+import sys
+from pathlib import Path
+
+_BACKEND = Path(__file__).parent.parent
+_RL_PATH = str(_BACKEND / "rl_system")
+if _RL_PATH not in sys.path:
+    sys.path.insert(0, _RL_PATH)
+
 import torch
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from grpo_system.config import local_config
+from grpo_system.model import load_model as _load_lora_model
 from app.reward_bridge import compute_reward as _compute_reward
 from ui.types import TraitConfig, ScoredTrait
 
-_MODEL_NAME    = "Qwen/Qwen2.5-1.5B-Instruct"
 _MAX_NEW_TOKENS = 256
 
 
-@st.cache_resource(show_spinner="Loading Qwen2.5 model…")
+@st.cache_resource(show_spinner="Loading Qwen2.5 + LoRA…")
 def _load_model():
-    """Load tokenizer + model once; reused across all Streamlit reruns."""
-    tokenizer = AutoTokenizer.from_pretrained(_MODEL_NAME, padding_side="left")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if torch.cuda.is_available():
-        model = AutoModelForCausalLM.from_pretrained(
-            _MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            _MODEL_NAME,
-            torch_dtype=torch.float32,
-        )
-
+    """
+    Load Qwen2.5-1.5B-Instruct with LoRA adapters once.
+    Reused for both inference and online GRPO training.
+    LoRA B matrices are zero-initialized so initial output = base model.
+    """
+    config = local_config()
+    model, tokenizer = _load_lora_model(config)
     model.eval()
     return model, tokenizer
+
+
+def get_shared_model():
+    """Return the cached (PeftModel, tokenizer) — shared by inference and training."""
+    return _load_model()
 
 
 class BackendAdapter:
@@ -66,7 +72,7 @@ class BackendAdapter:
 
     def generate_responses(self, prompt: str, n: int) -> list[str]:
         """
-        Generate n responses for the given prompt using Qwen2.5-1.5B-Instruct.
+        Generate n responses for the given prompt using Qwen2.5-1.5B-Instruct + LoRA.
 
         Args:
             prompt: combined article + instruction string from the Prompt page
@@ -76,6 +82,7 @@ class BackendAdapter:
             list of n decoded response strings
         """
         model, tokenizer = _load_model()
+        model.eval()
 
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(

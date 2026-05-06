@@ -1,6 +1,6 @@
-# Interactive System for LLMs and RLHF
+# LLMTuner
 
-An end-to-end Reinforcement Learning from Human Feedback (RLHF) research prototype. A human annotator steers the writing style of a language model by rating its outputs through a Streamlit UI. Ratings are converted into scalar rewards and used to fine-tune the model via GRPO (Group Relative Policy Optimization) with LoRA adapters. All work is organized into isolated experiment sessions so that different training runs never interfere with each other.
+An interactive system for behavioral fine-tuning of language models through human feedback. A human annotator steers the behavior of a language model by rating its outputs through a Streamlit UI. Ratings drive **online GRPO** (Group Relative Policy Optimization) training: the model updates in place in real time after every 3 grading rounds. All work is organized into isolated experiment sessions so that different training runs never interfere with each other.
 
 ---
 
@@ -34,20 +34,27 @@ The system has one goal: teach a language model to write in a style that a speci
         ↓
 Prompt page — human picks an article and writes an instruction
         ↓
-Grade page — Qwen2.5-1.5B-Instruct generates 2 or 4 responses
+Grade page — Qwen2.5-1.5B-Instruct + LoRA generates 2 or 4 responses
         ↓
-Human scores each response with sliders across defined traits
+Human sets target response length with a slider
+        ↓
+Human scores each response individually with sliders across defined traits
         ↓
 Scalar reward = Σ(weight_i × score_i) saved to session's interaction log
         ↓
-Train page — GRPO fine-tunes the model on saved interactions (background thread)
+[Every 3 complete grading rounds — online GRPO fires automatically]
+  Per-completion group-relative advantages computed
+  LoRA weights updated in place via AdamW
+  Next generation uses the refined model immediately
         ↓
-LoRA adapters saved to the session's grpo_output/ directory
+Session page — Save Session writes LoRA weights to disk
         ↓
-Export — download adapter ZIP or merge into a standalone model
+Export — download adapter ZIP or merge into a standalone model (user-triggered)
 ```
 
-The model rewrites real articles from a curated corpus. The human never writes generation prompts — they define evaluation traits once (in Setup) and then only rate outputs. Multiple independent sessions let you train toward different styles simultaneously without any interference.
+> **Export rule:** Export reads from the saved checkpoint on disk. Always **Save Session** before exporting.
+
+The model rewrites real articles from a curated corpus. The human defines evaluation traits once (in Setup) and then only rates outputs. Multiple independent sessions let you train toward different styles simultaneously without interference.
 
 ---
 
@@ -59,42 +66,44 @@ The model rewrites real articles from a curated corpus. The human never writes g
 │                                                                 │
 │  Sidebar:  Session Switcher  │  Navigation (6 pages)           │
 │                                                                 │
-│  Setup      → trait_manager.py   (load/edit reward traits)     │
-│  Prompt     → sklearn 20NG       (browse articles)             │
-│  Grade      → backend_adapter.py (generate + score + save)     │
-│  History    → ui/storage.py      (read JSONL log)              │
-│  Analytics  → pandas / st.chart  (reward trends)               │
-│  Train      → grpo_adapter.py    (GRPO in background thread)   │
+│  Setup      → trait_manager.py    (load/edit reward traits)    │
+│  Prompt     → sklearn 20NG        (browse articles)            │
+│  Grade      → backend_adapter.py  (generate + score + save)   │
+│               grpo_adapter.py     (online GRPO after 3 rounds) │
+│  History    → ui/storage.py       (read JSONL log)             │
+│  Analytics  → pandas / st.chart   (reward trends)              │
+│  Session    → grpo_adapter.py     (save/load weights + export) │
 └───────────────────────┬─────────────────────────────────────────┘
                         │
           ┌─────────────┴──────────────┐
           │                            │
   backend_adapter.py           grpo_adapter.py
-  ├─ _load_model()             ├─ load_scored_prompts()
-  │  @st.cache_resource         ├─ GRPOSession (thread)
-  │  Qwen2.5-1.5B-Instruct      ├─ save_session_record()
-  │  bfloat16 / float32         ├─ zip_adapter_dir()
-  └─ generate_responses()       └─ merge_and_export()
-     (chat template,
-      num_return_sequences=n)
-          │
-  app/reward_bridge.py          sessions/{name}/
-  └─ compute_reward()           ├─ interaction_log.jsonl
-     weighted sum                ├─ training_sessions.jsonl
-                                 └─ grpo_output/
-                                    (LoRA adapters)
+  ├─ _load_model()             ├─ OnlineGRPOSession (online)
+  │  @st.cache_resource         │   grpo_system/online_step.py
+  │  Qwen2.5-1.5B + LoRA        │   AdamW on shared model
+  │  4-bit QLoRA                ├─ save_online_checkpoint()
+  └─ generate_responses()       ├─ load_online_checkpoint()
+     model.eval()               ├─ reset_lora_weights()
+                                ├─ zip_adapter_dir()
+  app/reward_bridge.py          └─ merge_and_export()
+  └─ compute_reward()
+     weighted sum               sessions/{name}/
+                                ├─ interaction_log.jsonl
+                                └─ online_checkpoint/
+                                   (LoRA weights, saved by user)
 ```
 
 **Module responsibilities:**
 
 | Module | Role |
 |---|---|
-| `app.py` | Entry point; sidebar session switcher + page routing |
-| `backend_adapter.py` | Wraps model inference (`_load_model` cached) and reward computation |
-| `grpo_adapter.py` | Loads interaction log, runs GRPOTrainer in a background thread, saves adapters |
-| `ui/session_manager.py` | Path resolution per named session; create / list sessions |
-| `ui/state.py` | All `st.session_state` keys and accessors |
-| `ui/components.py` | All page-level rendering functions |
+| `app.py` | Entry point; sidebar session switcher + page routing; auto-loads checkpoint on startup/switch |
+| `backend_adapter.py` | Shared Qwen2.5+LoRA model for inference and online training; reward bridge |
+| `grpo_adapter.py` | `OnlineGRPOSession` (online step) + checkpoint save/load + `reset_lora_weights()` + export helpers |
+| `grpo_system/online_step.py` | Custom GRPO gradient step; uses `disable_adapter_layers()` for KL reference |
+| `ui/session_manager.py` | Path resolution per named session; create / list sessions; `online_checkpoint_dir()` |
+| `ui/state.py` | All `st.session_state` keys and accessors (including round buffer for online training) |
+| `ui/components.py` | All page-level rendering functions; online round tracking on Grade page |
 | `ui/storage.py` | JSONL read/write for interaction log |
 | `ui/types.py` | `TraitConfig`, `ScoredTrait`, `InteractionLog` dataclasses |
 | `app/trait_manager.py` | Loads `config/traits.json` |
@@ -165,9 +174,10 @@ uv run python -c "from sklearn.datasets import fetch_20newsgroups; print('datase
     │   └── grpo_system/
     │       ├── config.py                # GRPOConfig dataclass (local + colab presets)
     │       ├── model.py                 # load Qwen2.5 + LoRA adapters
+    │       ├── online_step.py           # custom GRPO gradient step for online training
     │       ├── data.py                  # build newsgroup prompts for training
-    │       ├── reward.py                # build_reward_fn() factory
-    │       └── train.py                 # main GRPOTrainer loop
+    │       ├── reward.py                # build_reward_fn() factory (standalone use)
+    │       └── train.py                 # standalone batch training script (not wired to UI)
     │
     ├── api/                             ← FastAPI REST layer (built, not yet integrated)
     │   ├── app.py
@@ -180,9 +190,9 @@ uv run python -c "from sklearn.datasets import fetch_20newsgroups; print('datase
     │       └── storage_service.py
     │
     └── user_interface/                  ← Streamlit app (main entry point)
-        ├── app.py                       # entry point + sidebar
-        ├── backend_adapter.py           # model inference + reward bridge
-        ├── grpo_adapter.py              # GRPO session management + export
+        ├── app.py                       # entry point + sidebar + auto-load checkpoint
+        ├── backend_adapter.py           # shared model (inference + online training) + reward
+        ├── grpo_adapter.py              # OnlineGRPOSession + checkpoint helpers + export
         ├── .streamlit/
         │   └── config.toml              # fileWatcherType = none (suppresses torchvision warnings)
         ├── config/
@@ -190,9 +200,7 @@ uv run python -c "from sklearn.datasets import fetch_20newsgroups; print('datase
         ├── sessions/                    # auto-created; one dir per experiment session
         │   └── {session_name}/
         │       ├── interaction_log.jsonl
-        │       ├── training_sessions.jsonl
-        │       └── grpo_output/
-        │           └── (LoRA adapter files)
+        │       └── online_checkpoint/   # LoRA weights, written by Save Session
         ├── app/
         │   ├── trait_manager.py         # load_traits(config_path)
         │   └── reward_bridge.py         # compute_reward(scores, traits)
@@ -213,8 +221,7 @@ uv run python -c "from sklearn.datasets import fetch_20newsgroups; print('datase
 A **session** is one isolated RLHF experiment. Each session has its own:
 
 - **Interaction log** — every scored response saved during grading
-- **Training history** — records of all GRPO runs (status, epochs, log lines, adapter path)
-- **LoRA adapters** — the fine-tuned model weights from training runs in this session
+- **Online checkpoint** — the LoRA adapter weights saved manually via the Session page
 
 Sessions live under `backend/user_interface/sessions/{name}/`:
 
@@ -222,24 +229,30 @@ Sessions live under `backend/user_interface/sessions/{name}/`:
 sessions/
 ├── default/                        ← created automatically on first launch
 │   ├── interaction_log.jsonl       ← grading data (prompt, response, traits, reward)
-│   ├── training_sessions.jsonl     ← GRPO run records (persists across restarts)
-│   └── grpo_output/                ← LoRA adapter files after training
+│   └── online_checkpoint/          ← LoRA weights (written by Save Session)
 │       ├── adapter_config.json
 │       ├── adapter_model.safetensors
 │       └── tokenizer files
-├── warm_tone/
+├── demo_session/
 │   └── ...
-└── concise_v2/
+└── warm_tone/
     └── ...
 ```
 
 ### Creating and switching sessions
 
-The **sidebar session panel** (always visible, above the page navigation) shows the active session as a dropdown. Switching immediately isolates all state — history, training session, and saved flag are reset so nothing leaks from the previous session.
+The **sidebar session panel** (always visible, above the page navigation) shows the active session as a dropdown. Switching sessions:
+1. Resets all in-memory state (history, round buffer, optimizer, step count)
+2. Zeros all LoRA B matrices (restores base model behavior)
+3. Auto-loads the new session's checkpoint if one exists
 
 To create a new session, use the **"New session"** expander in the sidebar:
 - Enter a name (letters, digits, `_`, `-` only; max 64 characters)
 - Click **Create & Switch** — the directory is created and becomes active immediately
+
+### Auto-load on startup
+
+On each fresh app start, if the active session has a saved checkpoint, it is loaded automatically (once per browser session, tracked by a `KEY_WEIGHTS_LOADED` flag).
 
 ### Interaction log format
 
@@ -274,7 +287,7 @@ On first launch, the `sessions/default/` directory is created automatically. The
 1. **Experiment Session** — dropdown of existing sessions + "New session" expander
 2. **Navigate** — the six page tabs
 
-Everything below — interaction log, training runs, adapter output — belongs to whichever session is selected in the dropdown.
+Everything below — interaction log, online checkpoint, exported model — belongs to whichever session is selected in the dropdown.
 
 ---
 
@@ -295,7 +308,8 @@ Browse the 20 Newsgroups dataset and build the prompt that will be sent to the m
 
 **Load Dataset** (expander):
 - Select one of the 20 newsgroup categories from the dropdown
-- Click **Load** — posts are fetched via `sklearn.datasets.fetch_20newsgroups` and cached in session state for the duration of the browser session
+- Set min/max character filters, then click **Load**
+- Posts are fetched via `sklearn.datasets.fetch_20newsgroups` and cached in session state
 
 **Choose a Post** (appears after loading):
 - **← Prev / Next →** buttons or a numeric jump input to navigate posts
@@ -303,37 +317,38 @@ Browse the 20 Newsgroups dataset and build the prompt that will be sent to the m
 - **Use as Article →** pushes the full post text into the Article field below
 
 **Article and Instruction fields** (form):
-- **Article** — the text the model will work with (auto-filled from dataset or pasted manually)
-- **Instruction** — what the model should do with the article (e.g., "Rewrite this to be more engaging and warm"). The last-used instruction is saved to `config/preset_instruction.txt` and pre-filled on next visit.
-- **Set Prompt** saves both fields to session state; **Clear** wipes the article only (instruction is kept)
+- **Article** — the text the model will work with
+- **Instruction** — what the model should do (e.g., "Rewrite this to be more engaging and warm"). The last-used instruction is saved to `config/preset_instruction.txt` and pre-filled on next visit.
+- **Set Prompt** saves both fields to session state; **Clear** wipes them
 
 ### Grade — Response & Scoring
 
 Generate model responses and score them.
 
-**Active Prompt** (collapsible expander at top) — shows the current article and instruction from the Prompt page.
+**Active Prompt** (collapsible expander at top) — shows the current article and instruction.
 
-**Generate Responses**:
-- Choose **2 or 4 responses** with the radio selector
-- Click **Generate Responses** — calls `Qwen2.5-1.5B-Instruct` via the cached `_load_model()` in `backend_adapter.py`. The model is loaded once and reused across all reruns.
-- On first click: the model downloads from HuggingFace (~3 GB) and loads into memory — this takes 1–3 minutes. Subsequent calls use the cached model.
-- Responses can also be typed or pasted manually.
+**Controls row:**
+- **Responses radio** — 2 or 4 responses
+- **Response length slider** — 25–400 words (step 25). The target word count is appended to the generation prompt as a soft instruction. The original prompt (without the hint) is saved to the log and the round buffer.
+- **Generate Responses** — calls Qwen2.5-1.5B-Instruct. Disabled while a training step is running.
+- **Clear All** — resets all responses and saved flags
 
 **Scoring** (per response):
-- One slider per trait (0–5 scale)
+- One slider per trait (−5 to +5)
 - Live reward breakdown: per-trait `score × weight = contribution`, and the final scalar reward
-- **Save Response** button — writes to the active session's `interaction_log.jsonl` and adds to History
+- **Save Response** button — writes to `interaction_log.jsonl`, adds to History, and records into the current online round
 
-**Clear All** — resets all responses and the saved flags (does not clear the prompt).
-
-> **Performance note:** On CPU-only hardware, generation takes roughly 2–5 minutes per click for 2 responses at 256 tokens. A GPU with ≥ 4 GB VRAM reduces this to seconds.
+**Online training status banner** (top of page, when a session is active):
+- Rounds buffered (X/3)
+- Training in progress indicator
+- Step count and last loss after completion
 
 ### History — Past Interactions
 
-Master-detail view of all saved interactions for the active session, loaded from `interaction_log.jsonl` at startup.
+Master-detail view of all saved interactions for the active session.
 
-- Left column: list of sessions sorted newest-first, labeled `[reward]  timestamp`
-- Right column: full detail for the selected entry — article excerpt, response text, per-trait metric tiles, and scalar reward
+- Left column: list of interactions sorted newest-first, labeled `[reward]  timestamp`
+- Right column: full detail — prompt, response, per-trait metric tiles, scalar reward
 
 ### Analytics — Reward Visualisation
 
@@ -341,47 +356,38 @@ Three tabs:
 
 | Tab | What it shows |
 |---|---|
-| Reward Trend | Line chart of scalar reward over time (x = interaction index) |
-| Trait Breakdown | Bar chart of average score per trait across all saved interactions |
+| Reward Trend | Line chart of scalar reward over time |
+| Trait Breakdown | Bar chart of average score per trait |
 | Statistics | Total sessions, average reward, max reward, min reward |
 
-### Train — GRPO Fine-Tuning
+### Session — Save, Load & Export
 
-Fine-tune the model on the active session's saved interactions using GRPO.
+Manage training progress and export the trained model.
 
-**Data summary** (top metrics):
-- Scored Prompts — unique prompts in the interaction log (averaged if rated multiple times)
-- Avg Reward — mean scalar reward across all logged interactions
-- Last Run — status of the most recent training session
+**Stats row:**
+- Graded Responses — total saved interactions this session
+- Avg Reward — mean scalar reward across the log
+- Online Training Steps — how many GRPO updates have fired
 
-**Training Config**:
-- Epochs (1–10); adapter output path is always the active session's `grpo_output/`
-- Model: `Qwen/Qwen2.5-1.5B-Instruct` with LoRA (rank 16, target modules: q/k/v/o_proj)
+**Save & Load:**
 
-**Start Training** — launches a background thread. The main UI stays responsive. Click **Refresh Log** to poll for new log lines.
+| Button | Action |
+|---|---|
+| **Save Session** | Writes current LoRA weights to `sessions/{name}/online_checkpoint/` |
+| **Load Saved Weights** | Restores checkpoint weights into the live model |
 
-**Training Log** — shows live progress:
-```
-Reading interaction log…
-Found 5 unique prompt(s) with human rewards.
-Loading Qwen/Qwen2.5-1.5B-Instruct with LoRA…
-Building dataset from logged prompts…
-Dataset: 5 prompt(s)
-Starting GRPO training…
-step 1  loss=2.34  reward=3.2
-step 2  loss=2.18  reward=3.5
-…
-Adapters saved to sessions/default/grpo_output/
-```
+Saved weights reload automatically on the next app start (or session switch).
 
-Every completed run (success or error) is saved to `training_sessions.jsonl` and appears in **Past Sessions** at the bottom of the page — full log and status survive app restarts.
+**Online Training Log** — shows all step messages from `OnlineGRPOSession.log`.
 
-**Export** (appears once `grpo_output/` exists):
+**Export** (visible once a checkpoint exists):
 
 | Tab | What it does |
 |---|---|
-| Download Adapters (ZIP) | Zips the adapter directory in memory and serves a `grpo_adapters.zip` download |
-| Merge & Export Full Model | Merges LoRA weights into base model, saves a standalone model loadable without PEFT |
+| Download Adapters (ZIP) | ZIPs `online_checkpoint/` in memory → download |
+| Merge & Export Full Model | Merges LoRA weights into base model, saves standalone model |
+
+> Always **Save Session** before exporting — export reads from disk, not from the live model.
 
 ---
 
@@ -407,9 +413,6 @@ uv run python scripts/verify.py       # sanity-checks output
 | Clean | `app/cleaner.py` | Remove divider lines, collapse whitespace |
 | Filter | `app/loader.py` | Drop posts shorter than 100 characters |
 | Export | `app/exporter.py` | Write to `.txt` (by category or by document) |
-
-**Categories (20 total):**
-`alt.atheism`, `comp.graphics`, `comp.os.ms-windows.misc`, `comp.sys.ibm.pc.hardware`, `comp.sys.mac.hardware`, `comp.windows.x`, `misc.forsale`, `rec.autos`, `rec.motorcycles`, `rec.sport.baseball`, `rec.sport.hockey`, `sci.crypt`, `sci.electronics`, `sci.med`, `sci.space`, `soc.religion.christian`, `talk.politics.guns`, `talk.politics.mideast`, `talk.politics.misc`, `talk.religion.misc`
 
 ---
 
@@ -437,9 +440,9 @@ There is no automatic scorer — the human is the judge. The reward system only 
 }
 ```
 
-Traits can be redefined in the Setup page at any time. Weights do not need to sum to 1.0, but normalized weights make rewards comparable across sessions.
+Traits can be redefined in the Setup page at any time. Weights do not need to sum to 1.0.
 
-**Score range:** 0–5 per trait. With three traits at weights 0.4 / 0.3 / 0.3, a perfect score yields `0.4×5 + 0.3×5 + 0.3×5 = 5.0`.
+**Score range:** −5 to +5 per trait. Negative scores are valid — they push the model away from bad behavior.
 
 **Code path:**
 
@@ -462,13 +465,15 @@ Grade page sliders
 **Loading** (`backend_adapter.py`):
 
 ```python
-@st.cache_resource(show_spinner="Loading Qwen2.5 model…")
+@st.cache_resource(show_spinner="Loading Qwen2.5 + LoRA…")
 def _load_model():
-    # GPU available → bfloat16 + device_map="auto"
-    # CPU only      → float32
+    config = local_config()              # 4-bit QLoRA on GPU, float32 on CPU
+    model, tokenizer = load_model(config)  # Qwen2.5-1.5B + LoRA adapters attached
+    model.eval()
+    return model, tokenizer
 ```
 
-The model is loaded once on first call and kept in memory for the Streamlit process lifetime. Rerunning the app (not restarting) reuses the cached model.
+The model is loaded once — with LoRA adapters attached — and shared for both inference and online GRPO training. LoRA B matrices are zero-initialized, so the model is functionally identical to the base at startup. After each online training step, the updated LoRA weights are live for the next `generate_responses()` call with no reload.
 
 **Inference:**
 
@@ -485,9 +490,9 @@ output_ids = model.generate(
 )
 ```
 
-The prompt is formatted using Qwen's chat template. `num_return_sequences` generates all responses in a single forward pass (more efficient than calling generate n times).
+The prompt passed to the model includes the response length hint (e.g., "Aim for roughly 150 words in your response."). The original prompt without this hint is saved to the interaction log.
 
-**Loading a trained session's adapters** (for inference after training):
+**Loading a saved checkpoint for inference outside the UI:**
 
 ```python
 from peft import PeftModel
@@ -499,15 +504,15 @@ base = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
-model = PeftModel.from_pretrained(base, "sessions/my_session/grpo_output")
-tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/grpo_output")
+model = PeftModel.from_pretrained(base, "sessions/my_session/online_checkpoint")
+tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/online_checkpoint")
 ```
 
-Or, if you exported a merged model, load it directly without PEFT:
+Or, if you exported a merged model:
 
 ```python
-model = AutoModelForCausalLM.from_pretrained("sessions/my_session/grpo_merged_model")
-tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/grpo_merged_model")
+model = AutoModelForCausalLM.from_pretrained("sessions/my_session/merged_model")
+tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/merged_model")
 ```
 
 ---
@@ -516,28 +521,40 @@ tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/grpo_merged_model
 
 ### Overview
 
-GRPO (Group Relative Policy Optimization) fine-tunes the model using human rewards as the training signal. Unlike PPO, it does not need a separate critic model — it generates a group of responses per prompt and uses their relative reward differences as advantages.
+GRPO (Group Relative Policy Optimization) fine-tunes the model using human rewards as the training signal. Unlike PPO, it does not need a separate critic model — it uses the relative reward differences within a group of responses per prompt as advantages.
 
-**Offline RLHF approach used here:**
+This system uses **online GRPO only**: the model updates in real time on the Grade page as you grade responses.
 
-The interaction log accumulates `(prompt, scalar_reward)` pairs from human grading. At training time, GRPO uses these saved rewards as the reward signal: for each generated completion, the reward function looks up the human-assigned reward for that prompt. This means training reinforces the model to generate responses on prompts that humans have already evaluated positively.
+| Property | Value |
+|---|---|
+| Trigger | Automatic after every 3 complete grading rounds |
+| Rewards | Per-completion (true GRPO — each response gets its own human score) |
+| Model update | In place on the shared model (no separate model instance) |
+| Optimizer | AdamW, persistent across all 3-round windows |
+| KL reference | `disable_adapter_layers()` — same model object, no second copy |
 
-### How it works
+### Online Training Step
+
+After every 3 complete grading rounds, `OnlineGRPOSession.step()` fires in a background thread:
 
 ```
-interaction_log.jsonl
+3 rounds buffered: [{prompt, completions: [{text, reward}, ...]}]
     ↓
-grpo_adapter.load_scored_prompts()
-    → {prompt: mean_scalar_reward}   (averaged if rated multiple times)
+grpo_system/online_step.grpo_step(model, tokenizer, groups, optimizer)
+    for each group:
+        advantages = (rewards − mean) / std      # group-relative
+        for each completion:
+            lp  = log_prob(model, prompt, text)  # LoRA active, grad flows
+            ref = log_prob(model, prompt, text)  # disable_adapter_layers, no grad
+            loss += −advantage × lp + β × KL(lp ∥ ref)
+    total.backward()
+    optimizer.step()                             # updates LoRA weights in place
     ↓
-GRPOSession._train()   (background thread)
-    → load_model() — Qwen2.5-1.5B-Instruct + LoRA
-    → build Dataset from logged prompts (apply chat template)
-    → reward_fn(prompts, completions) → looks up saved reward by prompt substring match
-    → TRL GRPOTrainer.train()
-    → model.save_pretrained(sessions/{name}/grpo_output/)
-    → save_session_record() → training_sessions.jsonl
+LoRA weights updated on shared model
+Next generate_responses() call uses updated weights
 ```
+
+The KL reference uses `disable_adapter_layers()` on the same model object — no second model copy needed. The AdamW optimizer persists across all 3-round windows so momentum accumulates.
 
 ### Configuration (`rl_system/grpo_system/config.py`)
 
@@ -556,55 +573,44 @@ GRPOConfig(
     batch_size          = 1,
     num_train_epochs    = 1,
     kl_coef             = 0.1,       # KL penalty — keeps model close to base
-    output_dir          = "sessions/{name}/grpo_output",
 )
-```
-
-### Session record format
-
-Every completed run (success or error) is appended to `training_sessions.jsonl`:
-
-```json
-{
-  "timestamp": "2026-04-28T21:00:00",
-  "status": "done",
-  "num_epochs": 1,
-  "n_prompts": 5,
-  "output_dir": "sessions/default/grpo_output",
-  "log": ["Reading interaction log…", "step 1  loss=2.34  reward=3.2", "…"],
-  "error": null
-}
 ```
 
 ---
 
 ## 12. Exporting a Trained Model
 
-After a training run completes, the **Export** section appears on the Train page.
+The **Session page → Export** section appears once a checkpoint has been saved.
+
+### Workflow
+
+1. Grade responses on the Grade page — online GRPO updates weights in memory
+2. Go to **Session page → Save Session** — writes weights to `sessions/{name}/online_checkpoint/`
+3. Choose an export format in the Export section
 
 ### Option A — Download LoRA Adapters (ZIP)
 
-Downloads `grpo_adapters.zip` containing all files from `sessions/{name}/grpo_output/`. These are the fine-tuned adapter weights only (~80 MB). Load them with:
+Downloads `{session}_adapters.zip` containing all files from `sessions/{name}/online_checkpoint/`. These are the fine-tuned adapter weights only (~80 MB). Load them with:
 
 ```python
 from peft import PeftModel
-model = PeftModel.from_pretrained(base_model, "path/to/extracted/adapters")
+model = PeftModel.from_pretrained(base_model, "path/to/extracted/online_checkpoint")
 ```
 
 ### Option B — Merge & Export Full Model
 
 Merges the LoRA adapter weights permanently into the base model's weights and saves a standalone model. The result requires no PEFT to load.
 
-- Output directory is configurable (default: `grpo_merged_model/`)
+- Output directory is configurable (default: `sessions/{name}/merged_model/`)
 - Runs `peft_model.merge_and_unload()` then `merged.save_pretrained(output_dir)`
-- The merged model is larger (~3 GB in bfloat16) but self-contained
+- The merged model is larger (~3 GB) but self-contained
 
 Load the merged model:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
-model = AutoModelForCausalLM.from_pretrained("grpo_merged_model")
-tokenizer = AutoTokenizer.from_pretrained("grpo_merged_model")
+model = AutoModelForCausalLM.from_pretrained("sessions/my_session/merged_model")
+tokenizer = AutoTokenizer.from_pretrained("sessions/my_session/merged_model")
 ```
 
 ---
@@ -642,6 +648,10 @@ uv run uvicorn app:app --reload --port 8000
 
 **Future integration:** The `BackendAdapter` in `user_interface/backend_adapter.py` is already designed to swap its direct function calls for HTTP calls to this API — the interface is identical.
 
+### Standalone Batch Trainer (`backend/rl_system/grpo_system/train.py`)
+
+A standalone GRPO training script that reads the interaction log and runs a full TRL `GRPOTrainer` pass. Not wired to the UI — intended for offline runs on larger hardware (e.g., Colab T4 with the 3B model).
+
 ---
 
 ## 14. Hardware Requirements
@@ -653,18 +663,18 @@ uv run uvicorn app:app --reload --port 8000
 | GPU ≥ 4 GB VRAM | ~30 sec (first load) | 10–30 sec |
 | CPU only | ~3–5 min (first load) | 2–5 min per click |
 
-### For GRPO training (Train page)
+### For online GRPO training (fires automatically after 3 rounds)
 
 | Hardware | Notes |
 |---|---|
 | GPU ≥ 4 GB VRAM | Runs with 4-bit QLoRA (`use_4bit=True` in `local_config()`) |
 | GPU ≥ 8 GB VRAM | Runs comfortably in bfloat16 without quantization |
-| CPU only | Possible but very slow — a single training epoch on 5 prompts may take hours |
+| CPU only | Possible but very slow — a single step may take many minutes |
 
-The 1.5B model (`Qwen2.5-1.5B-Instruct`) was chosen specifically to fit on a GTX 1650 (4 GB) with 4-bit quantization. Switch to `colab_config()` in `grpo_adapter.py` to use the 3B model on hardware with ≥ 12 GB VRAM:
+**VRAM breakdown for 4GB config:**
+- 4-bit model weights: ~1.5 GB
+- LoRA adapters + AdamW optimizer state: ~240 MB
+- Activations during training step: ~500 MB
+- Total peak: ~2.2 GB — fits comfortably on a GTX 1650
 
-```python
-# grpo_adapter.py, inside GRPOSession._train()
-from grpo_system.config import colab_config
-config = colab_config()   # Qwen2.5-3B-Instruct, bfloat16, num_generations=4
-```
+The 1.5B model (`Qwen2.5-1.5B-Instruct`) was chosen specifically to fit on a GTX 1650 (4 GB) with 4-bit quantization. Switch to `colab_config()` in `backend_adapter.py` to use the 3B model on hardware with ≥ 12 GB VRAM.
