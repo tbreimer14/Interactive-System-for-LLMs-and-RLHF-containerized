@@ -1,4 +1,7 @@
 [server]
+address = "0.0.0.0"
+port = 8501
+headless = true
 # Stop Streamlit's file watcher from scanning .venv — it triggers hundreds of
 # ModuleNotFoundError warnings from transformers vision models that need torchvision.
 fileWatcherType = "none"

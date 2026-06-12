@@ -26,6 +26,8 @@ dependencies = [
     "trl",
     "peft",
     "streamlit>=1.56.0",
+    "bitsandbytes>=0.49.2",
+    "scikit-learn>=1.8.0",
 ]
 
 [project.optional-dependencies]

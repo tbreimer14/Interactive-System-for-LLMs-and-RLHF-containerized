@@ -1,0 +1,70 @@
+services:
+  ui:
+    build: .
+    image: llmtuner:latest
+    container_name: llmtuner-ui
+    working_dir: /app/backend/user_interface
+    command:
+      - uv
+      - run
+      - streamlit
+      - run
+      - app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    ports:
+      - "8501:8501"
+    environment:
+      HF_HOME: /cache/huggingface
+      SCIKIT_LEARN_DATA: /cache/sklearn
+      BITSANDBYTES_NOWELCOME: "1"
+    volumes:
+      - hf_cache:/cache/huggingface
+      - sklearn_cache:/cache/sklearn
+      - sessions:/app/backend/user_interface/sessions
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: llmtuner:latest
+    container_name: llmtuner-api
+    working_dir: /app/backend/api
+    command:
+      - uv
+      - run
+      - uvicorn
+      - app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - api_data:/app/backend/api/data
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
+  sklearn_cache:
+  sessions:
+  api_data:

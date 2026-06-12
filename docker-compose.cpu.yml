@@ -1,0 +1,6 @@
+services:
+  ui:
+    deploy:
+      resources:
+        reservations:
+          devices: []

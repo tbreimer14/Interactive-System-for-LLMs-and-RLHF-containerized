@@ -180,12 +180,51 @@ For online training on 4GB VRAM:
 
 ## Running
 
+### Local (uv)
+
 ```bash
 cd backend/user_interface
 uv run streamlit run app.py
 ```
 
 First launch downloads Qwen2.5-1.5B-Instruct (~3GB, cached by HuggingFace).
+
+### Docker
+
+**Prerequisites:** Docker Engine 24+, Compose v2, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for GPU mode.
+
+**Quick start (GPU):**
+
+```bash
+docker compose up --build
+```
+
+- UI → http://localhost:8501
+- API → http://localhost:8000/docs
+
+**CPU fallback** (slow inference/training, no GPU required):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+```
+
+**Optional environment variables** (set in `.env` or compose `environment`):
+
+| Variable | Purpose |
+|---|---|
+| `HF_TOKEN` | HuggingFace token if model access is gated |
+| `HF_HOME` | Model cache directory (default `/cache/huggingface`) |
+| `SCIKIT_LEARN_DATA` | 20 Newsgroups cache (default `/cache/sklearn`) |
+| `BITSANDBYTES_NOWELCOME=1` | Suppress bitsandbytes startup banner |
+
+**Data persistence:** Docker named volumes preserve experiment sessions, LoRA checkpoints, model downloads, and API interaction logs across container restarts:
+
+| Volume | Contents |
+|---|---|
+| `sessions` | `backend/user_interface/sessions/` |
+| `hf_cache` | HuggingFace model cache (~3GB on first run) |
+| `sklearn_cache` | 20 Newsgroups dataset cache |
+| `api_data` | `backend/api/data/interactions.jsonl` |
 
 ---
 
